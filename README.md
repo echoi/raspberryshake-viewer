@@ -4,7 +4,7 @@ A lightweight, OS-independent desktop app for real-time seismograph display from
 
 Built for Earth Day outreach at the [Center for Earthquake Research and Information (CERI)](https://www.memphis.edu/ceri/), University of Memphis.
 
-![Three-channel waveform display](rshake_icon_preview.png)
+![Three-channel waveform display](raspberryshake_icon_preview.png)
 
 ---
 
@@ -37,7 +37,7 @@ pip install PyQt6 pyqtgraph numpy paramiko
 ## Run
 
 ```bash
-python rshake_viewer.py
+python raspberryshake_viewer.py
 ```
 
 On first launch a pre-flight dialog:
@@ -53,9 +53,9 @@ On first launch a pre-flight dialog:
 Put these four files in the same folder:
 
 ```
-rshake_viewer.py
+raspberryshake_viewer.py
 build_and_install.bat
-rshake_icon.ico
+raspberryshake_icon.ico
 ```
 
 Double-click `build_and_install.bat`. It will:
