@@ -2,7 +2,7 @@
 
 A lightweight, OS-independent desktop app for real-time seismograph display from a [Raspberry Shake](https://raspberryshake.org/) via SEEDLINK.
 
-Built for Earth Day outreach at the [Center for Earthquake Research and Information (CERI)](https://www.memphis.edu/ceri/), University of Memphis.
+Built for outreach activities at the [Center for Earthquake Research and Information (CERI)](https://www.memphis.edu/ceri/), University of Memphis.
 
 ![Three-channel waveform display](raspberryshake_icon_preview.png)
 
