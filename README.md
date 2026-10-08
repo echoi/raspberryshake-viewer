@@ -50,7 +50,7 @@ On first launch a pre-flight dialog:
 
 ## Windows Desktop Shortcut
 
-Put these four files in the same folder:
+Put these three files in the same folder:
 
 ```
 raspberryshake_viewer.py

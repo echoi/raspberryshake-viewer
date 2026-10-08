@@ -15,14 +15,14 @@ Requirements:
     pip install PyQt6 pyqtgraph numpy paramiko
 
 Run:
-    python rshake_viewer.py
+    python raspberryshake_viewer.py
 
 Optional CLI args:
     --rs-host       RS hostname/IP        (default: auto-detect)
     --port          SEEDLINK port         (default: 18000)
     --window        Seconds of data       (default: 60)
     --network       SEEDLINK network code (default: AM)
-    --station       SEEDLINK station code (default: wildcard R???0)
+    --station       SEEDLINK station code (default: R8049)
     --ssh-user      RS SSH username       (default: myshake)
     --ssh-pass      RS SSH password       (default: earthday2023)
     --skip-preflight  Skip discovery and clock-sync dialog
@@ -656,36 +656,13 @@ class SeedlinkListener(threading.Thread):
             f"SEEDLINK LIVE -- streaming from {self.host}:{self.port}"
         )
 
-        # ── Streaming loop with diagnostics ───────────────────────────
-        import os, pathlib
-        log_path = pathlib.Path.home() / "rshake_diag.txt"
-        diag_done = False   # only dump diagnostics once
-
+        # ── Streaming loop ────────────────────────────────────────────
         buf = b""
         while self.running:
             chunk = sock.recv(4096)
             if not chunk:
                 raise ConnectionError("Server closed stream")
             buf += chunk
-
-            # Diagnostic: dump first 600 bytes received to a file
-            if not diag_done and len(buf) >= 64:
-                diag_done = True
-                with open(log_path, "w") as lf:
-                    lf.write(f"=== RS SEEDLINK raw bytes (first {min(600,len(buf))}) ===\n")
-                    raw_sample = buf[:600]
-                    # hex dump
-                    for i in range(0, len(raw_sample), 16):
-                        row = raw_sample[i:i+16]
-                        hex_part = " ".join(f"{b:02X}" for b in row)
-                        asc_part = "".join(chr(b) if 32<=b<127 else "." for b in row)
-                        lf.write(f"  {i:04X}  {hex_part:<47}  {asc_part}\n")
-                    lf.write(f"\nFirst 8 bytes (SL header?): {raw_sample[:8]}\n")
-                    lf.write(f"Starts with SL: {raw_sample[:2] == b'SL'}\n")
-                    lf.write(f"Total bytes in buffer: {len(buf)}\n")
-                self.signals.status_changed.emit(
-                    f"Diagnostic log written to: {log_path}"
-                )
 
             # Each packet = 8-byte SL header + 512-byte MiniSEED record
             while len(buf) >= self.HEADER_LEN + self.RECORD_LEN:
