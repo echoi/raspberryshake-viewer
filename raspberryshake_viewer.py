@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QDialog, QTextEdit, QDialogButtonBox, QProgressBar,
     QComboBox, QMessageBox,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QEvent
 from PyQt6.QtGui import QFont, QColor, QPalette
 import pyqtgraph as pg
 
@@ -1301,6 +1301,11 @@ class ParticleMotionWindow(QWidget):
     phase difference between channels, then all three share one scale
     so the shape of the motion is not distorted.
 
+    Depth cues: the trail's shadows are projected onto the floor and the two
+    walls *behind* it (re-chosen as the camera moves), a drop line ties the
+    current point to its floor shadow, a slow auto-rotation adds motion
+    parallax, and a wide field of view strengthens perspective.
+
     Requires PyOpenGL (pyqtgraph.opengl); the caller handles ImportError.
     """
 
@@ -1308,7 +1313,12 @@ class ParticleMotionWindow(QWidget):
     TRAIL_DEFAULT  = 5
     HIGHPASS_SECS  = 1                     # moving-average window
     TRAIL_COLOR    = (1.0, 0.85, 0.40)     # amber
+    SHADOW_ALPHA   = 0.35                  # shadow opacity relative to trail
     SCALE_DECAY    = 0.97                  # per-frame shrink of display scale
+    ROTATE_DEG     = 0.12                  # auto-rotation per frame (~3.6 deg/s)
+    ROTATE_RESUME  = 2.0                   # seconds after a drag before resuming
+    CAMERA_FOV     = 75                    # degrees (pyqtgraph default is 60)
+    CAMERA_DIST    = 3.8
 
     def __init__(self, buffers, parent=None):
         import pyqtgraph.opengl as gl   # raises ImportError without PyOpenGL
@@ -1320,6 +1330,9 @@ class ParticleMotionWindow(QWidget):
         self.buffers    = buffers
         self.trail_secs = self.TRAIL_DEFAULT
         self._scale     = 0.0
+        self._walls     = None   # (x, y, z) of the current back walls / floor
+        self._dragging  = False
+        self._resume_at = 0.0    # auto-rotation resumes after this time
 
         # Map physical directions to stream channels (board labels are swapped)
         physical = {label: ch for ch, label in CHANNEL_LABELS.items()}
@@ -1337,6 +1350,7 @@ class ParticleMotionWindow(QWidget):
         self.info.setStyleSheet("color:#888; background:transparent;")
         bar.addWidget(self.info)
         bar.addStretch()
+        bar.addSpacing(16)   # keep the info text off the controls when narrow
 
         trail_lbl = QLabel("Trail:")
         trail_lbl.setStyleSheet("color:#888; background:transparent;")
@@ -1357,18 +1371,43 @@ class ParticleMotionWindow(QWidget):
             QPushButton:hover { background:#2D333B; color:#DDD; }
         """)
         reset_btn.clicked.connect(self._reset_view)
+
+        self.rotate_btn = QPushButton("Auto-rotate")
+        self.rotate_btn.setCheckable(True)
+        self.rotate_btn.setChecked(True)
+        self.rotate_btn.setStyleSheet("""
+            QPushButton { background:#1C2128; color:#999; border:1px solid #2D333B;
+                          border-radius:3px; padding:2px 10px; }
+            QPushButton:hover { background:#2D333B; color:#DDD; }
+            QPushButton:checked { background:#3B341A; color:#FFD966;
+                                  border:1px solid #6B5E2D; }
+        """)
+        bar.addWidget(self.rotate_btn)
         bar.addWidget(reset_btn)
         layout.addLayout(bar)
 
         self.view = gl.GLViewWidget()
         self.view.setBackgroundColor("#0D1117")
+        self.view.installEventFilter(self)   # pause auto-rotation while dragging
         layout.addWidget(self.view, stretch=1)
 
-        grid = gl.GLGridItem()
-        grid.setSize(2, 2)
-        grid.setSpacing(0.25, 0.25)
-        grid.setColor((255, 255, 255, 28))
-        self.view.addItem(grid)
+        # Bounding cube [-1, 1]^3 with grids on the floor and two back walls
+        corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)],
+                           dtype=float)
+        edges = [(a, b) for a in range(8) for b in range(a + 1, 8)
+                 if np.sum(corners[a] != corners[b]) == 1]
+        self.view.addItem(gl.GLLinePlotItem(
+            pos=np.array([corners[i] for e in edges for i in e]),
+            color=(1, 1, 1, 0.12), width=1, antialias=True, mode="lines",
+        ))
+        self.wall_grids = []
+        for _ in range(3):   # floor, x-wall, y-wall; placed in _place_walls()
+            grid = gl.GLGridItem()
+            grid.setSize(2, 2)
+            grid.setSpacing(0.25, 0.25)
+            grid.setColor((255, 255, 255, 22))
+            self.view.addItem(grid)
+            self.wall_grids.append(grid)
 
         # Axes colored like the matching waveform panel, labeled at both ends
         for vec, ch, pos_lbl, neg_lbl in [
@@ -1386,6 +1425,23 @@ class ParticleMotionWindow(QWidget):
                     pos=p, text=text, color=color, font=QFont("Arial", 10)
                 ))
 
+        # Shadows of the trail on floor / x-wall / y-wall, and of the head
+        self.shadows = []
+        for _ in range(3):
+            item = gl.GLLinePlotItem(
+                pos=np.zeros((2, 3)), width=1.5, antialias=True, mode="line_strip"
+            )
+            self.view.addItem(item)
+            self.shadows.append(item)
+        self.head_shadows = gl.GLScatterPlotItem(
+            pos=np.zeros((3, 3)), size=5, color=(1, 1, 1, 0.45)
+        )
+        self.view.addItem(self.head_shadows)
+        self.drop_line = gl.GLLinePlotItem(
+            pos=np.zeros((2, 3)), color=(1, 1, 1, 0.45), width=1, antialias=True
+        )
+        self.view.addItem(self.drop_line)
+
         self.trail = gl.GLLinePlotItem(
             pos=np.zeros((2, 3)), width=2, antialias=True, mode="line_strip"
         )
@@ -1395,13 +1451,45 @@ class ParticleMotionWindow(QWidget):
         )
         self.view.addItem(self.head)
         self._reset_view()
+        self._place_walls()
 
         self._timer = QTimer(self)
         self._timer.setInterval(33)   # ~30 fps is plenty for a 3D trail
         self._timer.timeout.connect(self._update)
 
     def _reset_view(self):
-        self.view.setCameraPosition(distance=4.2, elevation=22, azimuth=-60)
+        self.view.setCameraParams(fov=self.CAMERA_FOV, distance=self.CAMERA_DIST,
+                                  elevation=22, azimuth=-60)
+
+    def eventFilter(self, obj, event):
+        if obj is self.view:
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self._dragging = True
+            elif event.type() == QEvent.Type.MouseButtonRelease:
+                self._dragging = False
+                self._resume_at = time.time() + self.ROTATE_RESUME
+        return super().eventFilter(obj, event)
+
+    def _place_walls(self):
+        """Put the floor and two walls on the far side of the cube from the
+        camera, so shadows are always behind the trail, never in front."""
+        cam = self.view.cameraPosition()
+        walls = (-1.0 if cam.x() > 0 else 1.0,
+                 -1.0 if cam.y() > 0 else 1.0,
+                 -1.0 if cam.z() >= 0 else 1.0)
+        if walls == self._walls:
+            return
+        self._walls = walls
+        wx, wy, wz = walls
+        floor, xwall, ywall = self.wall_grids
+        floor.resetTransform()
+        floor.translate(0, 0, wz)
+        xwall.resetTransform()
+        xwall.rotate(90, 0, 1, 0)        # grid plane XY -> YZ
+        xwall.translate(wx, 0, 0)
+        ywall.resetTransform()
+        ywall.rotate(90, 1, 0, 0)        # grid plane XY -> XZ
+        ywall.translate(0, wy, 0)
 
     def showEvent(self, event):
         self._timer.start()
@@ -1419,12 +1507,19 @@ class ParticleMotionWindow(QWidget):
         return x[w - 1:] - mean
 
     def _update(self):
+        if (self.rotate_btn.isChecked() and not self._dragging
+                and time.time() >= self._resume_at):
+            self.view.orbit(self.ROTATE_DEG, 0)
+        self._place_walls()
+
         n = self.trail_secs * SAMPLE_RATE
         w = self.HIGHPASS_SECS * SAMPLE_RATE
         avail = min(len(self.buffers[ch]) for ch in (self.ch_e, self.ch_n, self.ch_z))
         if avail < w + 2:
-            self.trail.setData(pos=np.zeros((2, 3)))
+            for item in [self.trail, self.drop_line, *self.shadows]:
+                item.setData(pos=np.zeros((2, 3)))
             self.head.setData(pos=np.zeros((1, 3)))
+            self.head_shadows.setData(pos=np.zeros((3, 3)))
             self.info.setText("Waiting for data...")
             return
         m = min(n + w - 1, avail)
@@ -1445,6 +1540,18 @@ class ParticleMotionWindow(QWidget):
         colors[:, 3] = np.linspace(0.05, 1.0, len(pts))
         self.trail.setData(pos=pts, color=colors)
         self.head.setData(pos=pts[-1:])
+
+        # Shadows: the same points flattened onto each back wall
+        shadow_colors = colors.copy()
+        shadow_colors[:, 3] *= self.SHADOW_ALPHA
+        head_shadows = []
+        for axis, item in zip((2, 0, 1), self.shadows):   # floor, x-wall, y-wall
+            flat = pts.copy()
+            flat[:, axis] = self._walls[axis]
+            item.setData(pos=flat, color=shadow_colors)
+            head_shadows.append(flat[-1])
+        self.head_shadows.setData(pos=np.array(head_shadows))
+        self.drop_line.setData(pos=np.array([pts[-1], head_shadows[0]]))
         self.info.setText(
             f"Last {len(pts) / SAMPLE_RATE:.0f} s  |  high-pass ~0.5 Hz"
             f"  |  full scale ±{self._scale:,.0f} counts"

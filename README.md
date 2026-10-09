@@ -128,6 +128,12 @@ Double-click `build_and_install.bat`. It will:
 
 The **Particle Motion** window plots the ground's path through space: East on X, North on Y, Up on Z. The trail fades from oldest to newest, and the white dot marks the current position.
 
+Depth cues make the 3D shape readable:
+- **Shadows:** the trail is projected onto the floor and the two walls behind it, as faint copies. These act as built-in side views (East–North, East–Up, North–Up). The walls switch as the view turns, so the shadows always stay behind the trail.
+- **Drop line:** a thin line from the current point down to its shadow on the floor.
+- **Auto-rotate:** a slow turntable rotation, on by default (toggle with the **Auto-rotate** button). It pauses while you drag and resumes 2 s after you let go.
+- **Wide-angle perspective:** near parts of the scene look noticeably larger than far ones.
+
 - All three channels are high-passed identically (≈0.5 Hz, trailing 1 s mean removal) to remove the sensor's DC offset and drift without shifting their relative phase.
 - All axes share one scale, so the shape of the motion isn't distorted. The full-scale value in counts is shown in the window's top bar.
 - Axes follow the physical directions (the board's E/N labels are swapped; see `CHANNEL_LABELS`).

@@ -36,6 +36,9 @@ Shake SEEDLINK :18000 (or DemoSeedlinkServer on 127.0.0.1:<ephemeral>)
   - All channels get the same filter (trailing 1 s moving-average removal, about a 0.5 Hz high-pass), so their relative phase is preserved.
   - All axes share one scale.
   - `pyqtgraph.opengl` is imported lazily. Without PyOpenGL, the button shows an install hint instead.
+  - Depth cues: shadows on the floor and two walls, a drop line, auto-rotation and a 75° field of view. `_place_walls()` picks the walls on the far side from `view.cameraPosition()` each frame, and only moves the grids when the side changes. Shadows are the trail points with one coordinate pinned to that wall.
+  - Auto-rotation pauses while the mouse is held on the view (event filter) and resumes `ROTATE_RESUME` seconds after release.
+  - `CAMERA_DIST` 3.8 keeps the cube's near corner inside the view at a 75° field of view, down to about a 520×460 window. Re-check it if you change the field of view.
 - **Screenshots of the 3D view:** `QWidget.grab()` doesn't capture `GLTextItem` labels. Use `view.grabFramebuffer()`.
 - **Demo:**
   - `DemoQuakes` schedules quakes relative to the time the demo started (the first after about 8 s, then about every 40 s). `trigger()` adds one 1 s out.
@@ -59,9 +62,11 @@ python raspberryshake_viewer.py --demo
 - The owner commits directly to `main` (no PR flow). Commit or push only when asked.
 - Commit messages: a summary line, a wrapped body explaining *why*, and the `Co-Authored-By` trailer.
 
-## Status (as of 2026-10-08, commit 1dbe4cf)
+## Status (as of 2026-10-09)
 
-Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite. All pushed.
+Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite, 3D depth cues (shadows, drop line, auto-rotate, wider field of view). All pushed.
+
+Depth-cue ideas suggested but not built, if 3D still feels flat: brightness or color by distance from the camera, a shaded tube instead of a line, three flat side views next to the 3D window.
 
 Never verified on real hardware or Windows. Check these first when you have the Shake:
 - Live streaming on a real Shake: real record lengths decide the display delay (about 4 s against the fake server). Watch for dropped records, which would mean the `xn` check is failing.
