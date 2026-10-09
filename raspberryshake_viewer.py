@@ -570,9 +570,9 @@ def _decode_steim2(data, num_samp):
                     for i in range(6):
                         samples.append(_sign_extend((word >> (25 - 5*i)) & 0x1F, 5))
                 elif dnib == 2:
-                    # 7 differences, 4 bits each
+                    # 7 differences, 4 bits each (low 28 bits)
                     for i in range(7):
-                        samples.append(_sign_extend((word >> (28 - 4*i)) & 0xF, 4))
+                        samples.append(_sign_extend((word >> (24 - 4*i)) & 0xF, 4))
 
     return _integrate(x0, xn, samples, num_samp)
 
