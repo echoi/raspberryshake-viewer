@@ -1,0 +1,10 @@
+# App dependencies
+PyQt6
+pyqtgraph
+numpy
+paramiko
+PyOpenGL
+
+# Tests
+pytest
+obspy   # reference MiniSEED/Steim implementation

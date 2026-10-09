@@ -21,6 +21,7 @@ Built for outreach activities at the [Center for Earthquake Research and Informa
 - **Lock Scale** — freeze the Y range before touching the RS so handling spikes don't blow up the scale
 - **Pause / Resume** — SEEDLINK disconnects on pause; a flat gap scrolls through the plot; live signal resumes seamlessly after the gap
 - **Clear** — wipe all traces while staying connected
+- **Demo mode** — `--demo` simulates a Raspberry Shake with synthetic quakes; no hardware needed
 - **Windows Desktop shortcut** — one-click `build_and_install.bat` bundles everything into a standalone `.exe` with a custom icon
 
 ---
@@ -49,6 +50,23 @@ On first launch a pre-flight dialog:
 2. SSHs in and checks the RS clock against your machine's UTC
 3. Fixes clock drift automatically if > 60 s
 4. Connects the SEEDLINK stream and starts displaying
+
+### Demo mode (no Raspberry Shake needed)
+
+```bash
+python raspberryshake_viewer.py --demo
+```
+
+The app starts a built-in fake Shake: a local SEEDLINK server that streams synthetic EHZ/EHN/EHE data as real Steim-2 MiniSEED records. Everything from the network connection onward runs exactly as it would with real hardware (decoding, channel alignment, display, Pause/Resume, particle motion). Only the pre-flight discovery and clock sync are skipped.
+
+The synthetic ground motion includes:
+- background noise and a slow ~0.2 Hz microseism (ocean-wave hum)
+- a local quake about every 40 s (the first one ~8 s after start), each from a random direction, with
+  - **P wave** — straight-line motion along the ray, tilted up out of the ground
+  - **S wave** — larger, horizontal motion at right angles to the ray
+  - **Rayleigh wave** — slow, rolling *retrograde* elliptical motion in the vertical plane through the source
+
+A **Quake!** button appears in demo mode to set one off on demand (the P wave arrives about a second later, plus the usual display delay). The status bar counts down to the next automatic quake. Open **Particle Motion** with a 2 s trail to see each phase's shape.
 
 ---
 
@@ -84,6 +102,7 @@ Double-click `build_and_install.bat`. It will:
 | **Auto Scale** | Return to adaptive scaling |
 | **Clear** | Wipe traces; stream continues |
 | **Particle Motion** | Open the 3D particle-motion window (drag to rotate, scroll to zoom) |
+| **Quake!** | *(demo mode only)* Trigger a synthetic quake |
 | **Pause** | Disconnect SEEDLINK; flat gap scrolls through plot |
 | **Resume** | Reconnect; live signal follows the gap |
 
@@ -101,6 +120,7 @@ Double-click `build_and_install.bat`. It will:
 | `--ssh-user` | `myshake` | RS SSH username |
 | `--ssh-pass` | `earthday2023` | RS SSH password |
 | `--skip-preflight` | off | Skip discovery + clock sync |
+| `--demo` | off | Simulate a Raspberry Shake with synthetic quakes (no hardware) |
 
 ---
 
@@ -134,6 +154,21 @@ The RS runs a SEEDLINK server on port 18000 by default — no forwarding rules n
 | "Connected — waiting for first record…" | Normal for a few seconds; SEEDLINK buffers before sending |
 | Amber banner stays on | RS may have rebooted; app reconnects automatically |
 | Waveforms flat after launch | Wait ~5 s for initial auto-range to kick in |
+
+---
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite runs headless (Qt offscreen) and takes about 10 seconds. It uses [obspy](https://github.com/obspy/obspy) as an independent reference for MiniSEED (obspy is a test-only dependency; the app doesn't need it). It covers:
+
+- **Decoder** (`tests/test_decoder.py`): Steim-1/2 samples and start times match obspy for every packing width; corrupt and unsupported records are rejected
+- **Channel alignment** (`tests/test_aligner.py`): channels stay sample-aligned when each arrives with different record sizes and delays, plus overlaps, short gaps and long gaps
+- **Demo mode** (`tests/test_demo.py`): obspy decodes the demo's records exactly; synthetic P/S waves are linear in the right directions and Rayleigh waves are retrograde ellipses; an end-to-end run (demo server → SEEDLINK → decode → align → display buffers) keeps the P wave linear along its ray
 
 ---
 

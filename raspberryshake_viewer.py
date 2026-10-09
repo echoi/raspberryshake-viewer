@@ -12,6 +12,7 @@ Features:
   * Auto-reconnect with on-screen amber warning banner when connection drops
   * Channels time-aligned from MiniSEED record timestamps
   * Rotatable 3D particle-motion view (needs PyOpenGL)
+  * --demo mode: built-in synthetic Shake served over local SEEDLINK
 
 Requirements:
     pip install PyQt6 pyqtgraph numpy paramiko PyOpenGL
@@ -28,6 +29,7 @@ Optional CLI args:
     --ssh-user      RS SSH username       (default: myshake)
     --ssh-pass      RS SSH password       (default: earthday2023)
     --skip-preflight  Skip discovery and clock-sync dialog
+    --demo          Simulate a Raspberry Shake (synthetic quakes, no hardware)
 """
 
 import sys
@@ -598,6 +600,7 @@ class ChannelAligner:
     def __init__(self, channels):
         self.channels = list(channels)
         self._lock = threading.Lock()
+        self._has_pulled = False   # survives reset(): resume keeps scrolling
         self.reset()
 
     def reset(self):
@@ -640,15 +643,19 @@ class ChannelAligner:
 
     def pull(self, n):
         """
-        Return {ch: list} of exactly n samples per channel, all for the same
-        instants. When the slowest channel has no data yet, every channel
+        Return {ch: list} of n samples per channel (none until data first
+        arrives), all for the same instants. When the slowest channel has no data yet, every channel
         repeats its last value together (display latency grows instead of
         channels drifting apart); surplus latency is drained later.
         """
         with self._lock:
             if self._cursor is None:
                 if any(s is None for s in self._start.values()):
-                    return {ch: [self._last[ch]] * n for ch in self.channels}
+                    # Before any data ever arrived, draw nothing (avoids a
+                    # fake jump from 0 to the sensor offset); after a resume,
+                    # keep scrolling with the last values.
+                    n_hold = n if self._has_pulled else 0
+                    return {ch: [self._last[ch]] * n_hold for ch in self.channels}
                 self._cursor = max(self._start.values())
 
             # Drop data older than the cursor. If a channel restarted ahead of
@@ -694,6 +701,7 @@ class ChannelAligner:
 
     def _advance(self):
         """Consume the sample at the cursor from every channel."""
+        self._has_pulled = True
         for ch in self.channels:
             self._last[ch] = self._data[ch].popleft()
             self._start[ch] += 1
@@ -851,6 +859,274 @@ class SeedlinkListener(threading.Thread):
                 self._sock.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Demo mode: synthetic Raspberry Shake served over a local SEEDLINK socket
+# ---------------------------------------------------------------------------
+#
+# --demo runs a fake SEEDLINK server in-process and points the viewer at it,
+# so the real pipeline is exercised end to end: TCP handshake, SL framing,
+# Steim-2 MiniSEED decoding, timestamp alignment, display, particle motion.
+# ---------------------------------------------------------------------------
+
+# Steim-2 packings, densest first: (count, bits, code, dnib)
+_STEIM2_PACKINGS = [
+    (7, 4, 3, 2), (6, 5, 3, 1), (5, 6, 3, 0),
+    (4, 8, 1, None),
+    (3, 10, 2, 3), (2, 15, 2, 2), (1, 30, 2, 1),
+]
+_STEIM2_DATA_WORDS = 13 + 6 * 15   # 7 frames; frame 0 spends 2 words on x0/xn
+
+
+def _encode_steim2_record(seq, network, station, location, channel,
+                          start_idx, samples, prev):
+    """
+    Pack as many samples as fit into one 512-byte Steim-2 MiniSEED record.
+    start_idx is the absolute sample index (epoch seconds x SAMPLE_RATE) of
+    samples[0]; prev is the last sample of the previous record (or None).
+    Returns (record_bytes, samples_used).
+    """
+    diffs = [samples[0] - (samples[0] if prev is None else prev)]
+    diffs += [samples[i] - samples[i - 1] for i in range(1, len(samples))]
+
+    words, codes, i = [], [], 0
+    while i < len(diffs) and len(words) < _STEIM2_DATA_WORDS:
+        for count, bits, code, dnib in _STEIM2_PACKINGS:
+            chunk = diffs[i:i + count]
+            lim = 1 << (bits - 1)
+            if len(chunk) == count and all(-lim <= d < lim for d in chunk):
+                break
+        else:
+            raise ValueError("difference too large for Steim-2")
+        mask = (1 << bits) - 1
+        word = 0 if dnib is None else dnib << 30
+        for k, d in enumerate(chunk):
+            word |= (d & mask) << (bits * (count - 1 - k))
+        words.append(word)
+        codes.append(code)
+        i += count
+    used = i
+
+    # Lay words into frames: frame 0 = ctrl, x0, xn, 13 data; others 15 data
+    payload = b""
+    w = 0
+    for f in range(7):
+        frame_words = [0] * 16
+        frame_codes = [0] * 16
+        first = 3 if f == 0 else 1
+        for slot in range(first, 16):
+            if w < len(words):
+                frame_words[slot] = words[w]
+                frame_codes[slot] = codes[w]
+                w += 1
+        if f == 0:
+            frame_words[1] = samples[0] & 0xFFFFFFFF
+            frame_words[2] = samples[used - 1] & 0xFFFFFFFF
+        ctrl = 0
+        for slot, code in enumerate(frame_codes):
+            ctrl |= code << (30 - 2 * slot)
+        frame_words[0] = ctrl
+        payload += _struct.pack(">16I", *frame_words)
+
+    secs, rem = divmod(start_idx, SAMPLE_RATE)   # integer math: exact timestamp
+    t = datetime.datetime.fromtimestamp(secs, datetime.timezone.utc)
+    header = _struct.pack(
+        ">6scc5s2s3s2sHHBBBBHHhhBBBBiHH",
+        b"%06d" % (seq % 1_000_000), b"D", b" ",
+        station.encode().ljust(5), location.encode().ljust(2),
+        channel.encode().ljust(3), network.encode().ljust(2),
+        t.year, t.timetuple().tm_yday, t.hour, t.minute, t.second, 0,
+        rem * (10000 // SAMPLE_RATE),  # 0.0001 s units
+        used, SAMPLE_RATE, 1,          # num samples, rate factor, multiplier
+        0, 0, 0, 1,                    # flags, number of blockettes
+        0, 64, 48,                     # time correction, data offset, blockette offset
+    )
+    blockette_1000 = _struct.pack(">HHBBBB", 1000, 0, 11, 1, 9, 0)  # Steim-2, BE, 2^9
+    return header + blockette_1000 + b"\0" * 8 + payload, used
+
+
+class DemoQuakes:
+    """
+    Synthetic ground motion (East, North, Up in counts) from local quakes.
+
+    Each quake comes from a random direction and produces three phases with
+    textbook particle motion:
+      P         linear, along the ray (radial + vertical)
+      S (SH)    linear, horizontal and transverse to the ray
+      Rayleigh  retrograde ellipse in the radial-vertical plane
+    Plus a slow microseism and broadband noise (added by the server).
+    """
+
+    FIRST_QUAKE_SECS = 8      # first quake soon after start
+    MEAN_INTERVAL    = 40     # then roughly every 40 s (+/- 8 s)
+
+    def __init__(self, seed=None):
+        self._rng   = np.random.default_rng(seed)
+        self._lock  = threading.Lock()
+        self._quakes = []
+        self._next_auto = time.time() + self.FIRST_QUAKE_SECS
+
+    def _new_quake(self, t_p):
+        rng = self._rng
+        return dict(
+            t_p=t_p,
+            baz=rng.uniform(0, 2 * np.pi),            # direction to the source
+            inc=np.radians(rng.uniform(30, 55)),      # P incidence from vertical
+            sp=rng.uniform(3, 7),                     # S-P time (s)
+            amp=3000 * rng.uniform(0.6, 2.5),         # P peak (counts)
+        )
+
+    def trigger(self):
+        """Schedule a quake whose P wave arrives in about one second."""
+        with self._lock:
+            self._quakes.append(self._new_quake(time.time() + 1.0))
+
+    def next_arrival(self):
+        with self._lock:
+            upcoming = [q["t_p"] for q in self._quakes if q["t_p"] > time.time()]
+            return min(upcoming + [self._next_auto])
+
+    def motion(self, t):
+        """Ground motion at epoch times t (array) -> (east, north, up)."""
+        with self._lock:
+            while self._next_auto < t[-1] + 60:
+                self._quakes.append(self._new_quake(self._next_auto))
+                self._next_auto += self.MEAN_INTERVAL + self._rng.uniform(-8, 8)
+            quakes = [q for q in self._quakes if q["t_p"] - 1 < t[-1]
+                      and t[0] < q["t_p"] + 60]
+
+        # Microseism: ~0.2 Hz ocean-wave hum, different on each component
+        e = 400 * np.sin(2 * np.pi * 0.17 * t) + 250 * np.sin(2 * np.pi * 0.23 * t + 1.0)
+        n = 350 * np.sin(2 * np.pi * 0.19 * t + 2.0) + 200 * np.sin(2 * np.pi * 0.13 * t)
+        z = 300 * np.sin(2 * np.pi * 0.21 * t + 0.5)
+
+        def pulse(dt, f, tau):
+            """Sinusoid at f Hz under a fast-rise, exponential-decay envelope."""
+            dt = np.maximum(dt, 0)
+            return np.sin(2 * np.pi * f * dt) * (dt / tau) * np.exp(1 - dt / tau)
+
+        for q in quakes:
+            # Radial unit vector points away from the source
+            r_e, r_n = -np.sin(q["baz"]), -np.cos(q["baz"])
+            dt = t - q["t_p"]
+            p = q["amp"] * pulse(dt, 5.0, 0.8)
+            e += p * r_e * np.sin(q["inc"])
+            n += p * r_n * np.sin(q["inc"])
+            z += p * np.cos(q["inc"])
+
+            s = 2.5 * q["amp"] * pulse(dt - q["sp"], 3.0, 1.2)
+            e += s * -r_n        # transverse: radial rotated 90 degrees
+            n += s * r_e
+
+            dr = dt - 1.8 * q["sp"]
+            env = 3.0 * q["amp"] * np.exp(-((dr - 4.0) / 2.5) ** 2) * (dr > 0)
+            phase = 2 * np.pi * 1.2 * dr
+            radial = -env * np.sin(phase)          # retrograde ellipse
+            e += radial * r_e
+            n += radial * r_n
+            z += 1.5 * env * np.cos(phase)
+        return e, n, z
+
+
+class DemoSeedlinkServer(threading.Thread):
+    """
+    Minimal SEEDLINK server on 127.0.0.1 streaming synthetic EHZ/EHN/EHE.
+
+    Mimics a real Shake: ~DC offsets, records flushed when full or after
+    MAX_RECORD_SECS, and each channel delivered with a different delay so
+    the viewer's timestamp alignment is exercised.
+    """
+
+    MAX_RECORD_SECS = 1.0
+    CHANNEL_LAG     = {"EHZ": 0.0, "EHN": 0.35, "EHE": 0.7}
+    DC_OFFSET       = {"EHZ": 16500, "EHN": -8200, "EHE": 3100}
+    NOISE_COUNTS    = 120
+
+    def __init__(self, network=RS_NETWORK_DEFAULT, station=RS_STATION_DEFAULT,
+                 location=RS_LOCATION_CODE, seed=None):
+        super().__init__(daemon=True)
+        self.network, self.station, self.location = network, station, location
+        self.quakes = DemoQuakes(seed)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))   # any free port
+        self._sock.listen()
+        self.port = self._sock.getsockname()[1]
+        # Physical direction -> stream channel (the board labels are swapped)
+        physical = {label: ch for ch, label in CHANNEL_LABELS.items()}
+        self._ch_e, self._ch_n, self._ch_z = physical["EHE"], physical["EHN"], physical["EHZ"]
+
+    def run(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            f = conn.makefile("rb")
+            while True:
+                line = f.readline().strip().upper()
+                if not line:
+                    return
+                if line == b"HELLO":
+                    conn.sendall(b"SeedLink v3.1 (Raspberry Shake demo)\r\nDEMO\r\n")
+                elif line == b"END":
+                    break
+                else:
+                    conn.sendall(b"OK\r\n")
+            self._stream(conn)
+        except OSError:
+            pass   # viewer disconnected (pause / quit)
+        finally:
+            conn.close()
+
+    def _stream(self, conn):
+        rng = np.random.default_rng()
+        next_idx = int(time.time() * SAMPLE_RATE)
+        pending  = {ch: [] for ch in CHANNELS}
+        start    = {ch: next_idx for ch in CHANNELS}
+        prev     = {ch: None for ch in CHANNELS}
+        outbox   = []    # (send_time, record)
+        seq      = 0
+        while True:
+            now = time.time()
+            now_idx = int(now * SAMPLE_RATE)
+            if now_idx > next_idx:
+                t = np.arange(next_idx, now_idx) / SAMPLE_RATE
+                e, n, z = self.quakes.motion(t)
+                for ch, x in ((self._ch_e, e), (self._ch_n, n), (self._ch_z, z)):
+                    x = x + self.DC_OFFSET[ch] + rng.normal(0, self.NOISE_COUNTS, len(t))
+                    pending[ch].extend(np.round(x).astype(int).tolist())
+                next_idx = now_idx
+
+            for ch in CHANNELS:
+                while pending[ch]:
+                    rec, used = _encode_steim2_record(
+                        seq, self.network, self.station, self.location, ch,
+                        start[ch], pending[ch], prev[ch],
+                    )
+                    full = used < len(pending[ch])
+                    stale = now - start[ch] / SAMPLE_RATE >= self.MAX_RECORD_SECS
+                    if not (full or stale):
+                        break
+                    outbox.append((now + self.CHANNEL_LAG[ch], rec))
+                    prev[ch] = pending[ch][used - 1]
+                    del pending[ch][:used]
+                    start[ch] += used
+                    seq += 1
+
+            outbox.sort(key=lambda item: item[0])
+            while outbox and outbox[0][0] <= now:
+                _, rec = outbox.pop(0)
+                conn.sendall(b"SL%06X" % (seq % 0x1000000) + rec)
+            time.sleep(0.05)
+
+    def stop(self):
+        self._sock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1180,11 +1456,14 @@ class ParticleMotionWindow(QWidget):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    def __init__(self, rs_host, port, network, station, window_secs):
+    def __init__(self, rs_host, port, network, station, window_secs, demo=None):
         super().__init__()
         self.rs_host     = rs_host or "unknown"
         self.window_secs = window_secs
-        self.setWindowTitle("Raspberry Shake -- Live Waveform Viewer")
+        self.demo        = demo      # DemoSeedlinkServer in --demo mode, else None
+        self.setWindowTitle(
+            "Raspberry Shake -- Live Waveform Viewer" + ("  [DEMO]" if demo else "")
+        )
         self.resize(1100, 660)
         self.setMinimumSize(700, 420)
         self.setStyleSheet(
@@ -1222,9 +1501,12 @@ class MainWindow(QMainWindow):
         root.setSpacing(6)
 
         header = QHBoxLayout()
+        # DEMO badge goes first so it can't be truncated when the header is tight
         title = QLabel(
-            f"Raspberry Shake  --  Real-Time Seismograph"
-            f"   <span style='font-size:10px; color:#444;'>({self.rs_host})</span>"
+            ("<span style='color:#FFB347;'>DEMO</span>&nbsp;&nbsp;" if self.demo else "")
+            + f"Raspberry Shake  --  Real-Time Seismograph"
+            + ("" if self.demo else
+               f"   <span style='font-size:10px; color:#444;'>({self.rs_host})</span>")
         )
         title.setFont(QFont("Georgia", 13, QFont.Weight.Bold))
         title.setStyleSheet("color:#E6EDF3; background:transparent;")
@@ -1294,6 +1576,22 @@ class MainWindow(QMainWindow):
         """)
         pm_btn.clicked.connect(self._show_particle_motion)
         header.addWidget(pm_btn)
+
+        # Demo only: trigger a synthetic quake on demand
+        if self.demo:
+            quake_btn = QPushButton("  Quake!  ")
+            quake_btn.setFixedHeight(28)
+            quake_btn.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+            quake_btn.setStyleSheet("""
+                QPushButton {
+                    background: #3B2A1A; color: #FFB347;
+                    border: 1px solid #6B4A2D; border-radius: 4px; padding: 0 14px;
+                }
+                QPushButton:hover   { background: #5C4020; color: #FFD080; }
+                QPushButton:pressed { background: #7A5528; }
+            """)
+            quake_btn.clicked.connect(self.demo.quakes.trigger)
+            header.addWidget(quake_btn)
 
         # Pause / Resume button
         self.stop_btn = QPushButton("  Pause  ")
@@ -1545,9 +1843,13 @@ class MainWindow(QMainWindow):
         pkts = self.listener.packet_count
         if self.listener._connected:
             if active:
+                demo_info = ""
+                if self.demo:
+                    wait = self.demo.quakes.next_arrival() - time.time()
+                    demo_info = f"   |  DEMO: next quake in ~{max(0, wait):.0f} s"
                 self.status_bar.showMessage(
                     f"SEEDLINK LIVE  --  Channels: {', '.join(active)}"
-                    f"   |  Records received: {pkts}"
+                    f"   |  Records received: {pkts}{demo_info}"
                 )
             else:
                 self.status_bar.showMessage(
@@ -1564,6 +1866,8 @@ class MainWindow(QMainWindow):
         self.listener.stop()
         if self._pm_window is not None:
             self._pm_window.close()
+        if self.demo:
+            self.demo.stop()
         event.accept()
 
 
@@ -1581,6 +1885,9 @@ def main():
     parser.add_argument("--ssh-user",       default=RS_SSH_USER_DEFAULT)
     parser.add_argument("--ssh-pass",       default=RS_SSH_PASS_DEFAULT)
     parser.add_argument("--skip-preflight", action="store_true")
+    parser.add_argument("--demo", action="store_true",
+                        help="simulate a Raspberry Shake with synthetic quakes "
+                             "(no hardware needed)")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
@@ -1596,8 +1903,14 @@ def main():
     palette.setColor(QPalette.ColorRole.ButtonText,    QColor("#E6EDF3"))
     app.setPalette(palette)
 
+    demo = None
+    port = args.port
     rs_host = args.rs_host
-    if not args.skip_preflight:
+    if args.demo:
+        demo = DemoSeedlinkServer(network=args.network, station=args.station)
+        demo.start()
+        rs_host, port = "127.0.0.1", demo.port
+    elif not args.skip_preflight:
         dlg = PreflightDialog(args.ssh_user, args.ssh_pass)
         dlg.exec()
         if dlg.rs_host:
@@ -1608,10 +1921,11 @@ def main():
 
     win = MainWindow(
         rs_host=rs_host,
-        port=args.port,
+        port=port,
         network=args.network,
         station=args.station,
         window_secs=args.window,
+        demo=demo,
     )
     win.show()
     sys.exit(app.exec())
