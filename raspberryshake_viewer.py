@@ -10,9 +10,11 @@ Features:
   * 3-channel scrolling waveform with per-channel and global amplitude controls
   * SEEDLINK TCP stream -- reliable, ordered, no RS-side UDP config needed
   * Auto-reconnect with on-screen amber warning banner when connection drops
+  * Channels time-aligned from MiniSEED record timestamps
+  * Rotatable 3D particle-motion view (needs PyOpenGL)
 
 Requirements:
-    pip install PyQt6 pyqtgraph numpy paramiko
+    pip install PyQt6 pyqtgraph numpy paramiko PyOpenGL
 
 Run:
     python raspberryshake_viewer.py
@@ -41,6 +43,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QSizePolicy, QStatusBar,
     QGroupBox, QDialog, QTextEdit, QDialogButtonBox, QProgressBar,
+    QComboBox, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
 from PyQt6.QtGui import QFont, QColor, QPalette
@@ -375,7 +378,8 @@ import struct as _struct
 def _decode_miniseed(raw):
     """
     Parse a 512-byte MiniSEED record.
-    Returns (channel_code: str, samples: list[int]) or (None, []) on error.
+    Returns (channel_code: str, start_time: float, samples: list[int]),
+    or (None, None, []) on error. start_time is UTC epoch seconds.
     Handles Steim-1 (encoding 10) and Steim-2 (encoding 11).
 
     MiniSEED fixed header layout (big-endian):
@@ -386,17 +390,17 @@ def _decode_miniseed(raw):
       13-14  location (2 chars)
       15-17  channel (3 chars)
       18-19  network (2 chars)
-      20-21  num_samples (uint16)
-      24-27  start time (various)
-      28     sample rate factor (int16)
-      30     sample rate multiplier (int16)
-      32     activity flags
-      33     IO flags
-      34     data quality flags
-      35     num_blockettes
-      36-39  time correction
-      40-41  data offset (uint16)  <-- byte offset to first data sample
-      42-43  first blockette offset (uint16)
+      20-29  start time (BTIME: year, day-of-year, h, m, s, -, 0.0001 s)
+      30-31  num_samples (uint16)
+      32-33  sample rate factor (int16)
+      34-35  sample rate multiplier (int16)
+      36     activity flags  (bit 0x02 = time correction applied)
+      37     IO flags
+      38     data quality flags
+      39     num_blockettes
+      40-43  time correction (int32, 0.0001 s)
+      44-45  data offset (uint16)  <-- byte offset to first data sample
+      46-47  first blockette offset (uint16)
     """
     try:
         # Confirmed correct offsets from live RS packet hex dump:
@@ -406,6 +410,15 @@ def _decode_miniseed(raw):
         num_samp = _struct.unpack_from(">H", raw, 30)[0]
         data_off = _struct.unpack_from(">H", raw, 44)[0]
         blkt_off = _struct.unpack_from(">H", raw, 46)[0]
+
+        year, doy, hh, mm, ss, _, frac = _struct.unpack_from(">HHBBBBH", raw, 20)
+        start = (
+            datetime.datetime(year, 1, 1, tzinfo=datetime.timezone.utc)
+            + datetime.timedelta(days=doy - 1, hours=hh, minutes=mm,
+                                 seconds=ss, microseconds=frac * 100)
+        ).timestamp()
+        if not raw[36] & 0x02:   # correction not yet applied to start time
+            start += _struct.unpack_from(">i", raw, 40)[0] * 1e-4
 
         # Default to Steim-2 (confirmed encoding=11 on RS)
         encoding = 11
@@ -419,13 +432,14 @@ def _decode_miniseed(raw):
             next_blkt = _struct.unpack_from(">H", raw, off + 2)[0]
             if blkt_type == 1000:
                 encoding = raw[off + 4]
-                break
+            elif blkt_type == 1001:   # extra microseconds of start time
+                start += _struct.unpack_from(">b", raw, off + 5)[0] * 1e-6
             if next_blkt == 0 or next_blkt == off:
                 break
             off = next_blkt
 
         if num_samp == 0 or data_off == 0 or data_off >= 512:
-            return None, []
+            return None, None, []
 
         payload = raw[data_off:]
 
@@ -434,28 +448,29 @@ def _decode_miniseed(raw):
         elif encoding == 11:
             samples = _decode_steim2(payload, num_samp)
         else:
-            return None, []
+            return None, None, []
 
-        return channel, samples
+        return channel, start, samples
     except Exception:
-        return None, []
+        return None, None, []
 
 
 def _decode_steim1(data, num_samp):
     """Decode Steim-1 compressed data."""
     samples = []
-    x0 = None
+    x0 = xn = None
     frames = len(data) // 64
     for f in range(frames):
         frame = data[f*64:(f+1)*64]
         ctrl  = _struct.unpack_from(">I", frame, 0)[0]
-        for w in range(15):
+        for w in range(1, 16):   # word 0 is the control word itself
             code = (ctrl >> (30 - 2*w)) & 0x3
-            word = _struct.unpack_from(">i", frame, (w+1)*4)[0]
-            if f == 0 and w == 0:
-                x0 = _struct.unpack_from(">i", frame, 4)[0]
-                continue
+            word = _struct.unpack_from(">i", frame, w*4)[0]
             if f == 0 and w == 1:
+                x0 = word
+                continue
+            if f == 0 and w == 2:
+                xn = word
                 continue
             if code == 0:
                 continue
@@ -470,15 +485,25 @@ def _decode_steim1(data, num_samp):
             elif code == 3:   # 1 x 32-bit
                 samples.append(word)
 
-    # Integrate differences
-    if x0 is None:
+    return _integrate(x0, xn, samples, num_samp)
+
+
+def _integrate(x0, xn, diffs, num_samp):
+    """
+    Rebuild samples from Steim differences. diffs[0] links to the previous
+    record, so x0 is the first sample and integration starts at diffs[1].
+    The record is dropped if the result does not end at xn (corrupt data).
+    """
+    if x0 is None or len(diffs) < num_samp:
         return []
-    out, val = [], x0
-    out.append(val)
-    for d in samples[:num_samp-1]:
+    out = [x0]
+    val = x0
+    for d in diffs[1:num_samp]:
         val += d
         out.append(val)
-    return out[:num_samp]
+    if val != xn:
+        return []
+    return out
 
 
 def _sign_extend(value, bits):
@@ -493,23 +518,24 @@ def _decode_steim2(data, num_samp):
     Uses Python arbitrary-precision ints throughout to avoid overflow.
     """
     samples = []
-    x0      = None
+    x0 = xn = None
     frames  = len(data) // 64
 
     for f in range(frames):
         frame = data[f*64:(f+1)*64]
         ctrl  = _struct.unpack_from(">I", frame, 0)[0]  # control word
 
-        for w in range(15):
+        for w in range(1, 16):   # word 0 is the control word itself
             code = (ctrl >> (30 - 2*w)) & 0x3
-            word = _struct.unpack_from(">I", frame, (w+1)*4)[0]  # unsigned 32-bit
+            word = _struct.unpack_from(">I", frame, w*4)[0]  # unsigned 32-bit
 
-            # Frame 0 words 0/1 hold x0 (forward integration constant) and xn
-            if f == 0 and w == 0:
-                x0 = _struct.unpack_from(">i", frame, 4)[0]   # signed
-                continue
+            # Frame 0 words 1/2 hold x0 (forward integration constant) and xn
             if f == 0 and w == 1:
-                continue   # xn (last sample) — not needed for forward decode
+                x0 = _sign_extend(word, 32)
+                continue
+            if f == 0 and w == 2:
+                xn = _sign_extend(word, 32)   # last sample — integrity check
+                continue
 
             if code == 0:
                 continue   # unused word
@@ -548,16 +574,130 @@ def _decode_steim2(data, num_samp):
                     for i in range(7):
                         samples.append(_sign_extend((word >> (28 - 4*i)) & 0xF, 4))
 
-    if x0 is None:
-        return []
+    return _integrate(x0, xn, samples, num_samp)
 
-    # Integrate differences using Python ints (no overflow risk)
-    out = [x0]
-    val = x0
-    for d in samples[:num_samp - 1]:
-        val += d
-        out.append(val)
-    return out[:num_samp]
+
+class ChannelAligner:
+    """
+    Time-aligns the three channels using each record's start time.
+
+    Samples are keyed by absolute sample index (epoch seconds x SAMPLE_RATE),
+    so the display always pulls the *same instant* from every channel, no
+    matter in what order or how late each channel's records arrive.
+    Correct alignment matters for particle motion: a 0.1 s inter-channel
+    offset on a 5 Hz wave turns linear motion into a spurious ellipse.
+
+    The SEEDLINK thread calls push(); the display timer calls pull().
+    """
+
+    MAX_GAP_FILL   = 10 * SAMPLE_RATE   # bridge gaps up to 10 s with last value
+    MAX_BACKLOG    = 30 * SAMPLE_RATE   # beyond this, jump ahead to recent data
+    CATCHUP_PERIOD = 10 * SAMPLE_RATE   # samples between latency re-evaluations
+    LATENCY_MARGIN = SAMPLE_RATE // 5   # keep 0.2 s of jitter headroom
+
+    def __init__(self, channels):
+        self.channels = list(channels)
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self._data  = {ch: deque() for ch in self.channels}
+            self._start = {ch: None for ch in self.channels}  # index of _data[ch][0]
+            self._last  = {ch: 0 for ch in self.channels}     # last value pulled
+            self._cursor = None          # next sample index to display
+            self._catchup = 0            # surplus samples to drain early
+            self._min_backlog = None     # lowest backlog seen this period
+            self._period_left = self.CATCHUP_PERIOD
+
+    def push(self, ch, start_time, samples):
+        n0 = int(round(start_time * SAMPLE_RATE))
+        with self._lock:
+            data = self._data[ch]
+            if self._start[ch] is None:
+                self._start[ch] = n0
+                data.extend(samples)
+                return
+            expected = self._start[ch] + len(data)
+            delta = n0 - expected
+            if abs(delta) <= 1:            # contiguous (allow rounding jitter)
+                data.extend(samples)
+            elif delta < 0:                # overlap / duplicate: keep new part
+                data.extend(samples[-delta:])
+            elif delta <= self.MAX_GAP_FILL:
+                fill = data[-1] if data else self._last[ch]
+                data.extend([fill] * delta)
+                data.extend(samples)
+            else:                          # long gap: restart this channel
+                data.clear()
+                self._start[ch] = n0
+                data.extend(samples)
+
+    def _backlog(self):
+        """Samples available from the cursor on the slowest channel.
+        Only valid after _seek(), when every channel starts at the cursor."""
+        return min(len(self._data[ch]) for ch in self.channels)
+
+    def pull(self, n):
+        """
+        Return {ch: list} of exactly n samples per channel, all for the same
+        instants. When the slowest channel has no data yet, every channel
+        repeats its last value together (display latency grows instead of
+        channels drifting apart); surplus latency is drained later.
+        """
+        with self._lock:
+            if self._cursor is None:
+                if any(s is None for s in self._start.values()):
+                    return {ch: [self._last[ch]] * n for ch in self.channels}
+                self._cursor = max(self._start.values())
+
+            # Drop data older than the cursor. If a channel restarted ahead of
+            # the cursor (long gap), skip all channels past the hole.
+            self._seek(max(self._cursor, *self._start.values()))
+
+            backlog = self._backlog()
+            if backlog > self.MAX_BACKLOG:
+                self._seek(self._cursor + backlog - self.LATENCY_MARGIN)
+                backlog = self._backlog()
+
+            # Track the minimum backlog; anything above the margin is excess
+            # latency that can be drained by pulling one extra sample per tick.
+            if self._min_backlog is None or backlog < self._min_backlog:
+                self._min_backlog = backlog
+            self._period_left -= n
+            if self._period_left <= 0:
+                self._catchup = max(0, self._min_backlog - self.LATENCY_MARGIN)
+                self._min_backlog = None
+                self._period_left = self.CATCHUP_PERIOD
+
+            # Catch up gently: skip at most one sample per pull (~25 sps)
+            if self._catchup > 0 and backlog > n:
+                self._advance()
+                self._catchup -= 1
+
+            out = {ch: [] for ch in self.channels}
+            for _ in range(n):
+                if self._backlog() > 0:
+                    self._advance()
+                for ch in self.channels:
+                    out[ch].append(self._last[ch])
+            return out
+
+    def _seek(self, cursor):
+        """Move the cursor forward, discarding every channel's older samples."""
+        for ch in self.channels:
+            data = self._data[ch]
+            for _ in range(min(max(0, cursor - self._start[ch]), len(data))):
+                self._last[ch] = data.popleft()
+            self._start[ch] = max(self._start[ch], cursor)
+        self._cursor = cursor
+
+    def _advance(self):
+        """Consume the sample at the cursor from every channel."""
+        for ch in self.channels:
+            self._last[ch] = self._data[ch].popleft()
+            self._start[ch] += 1
+        self._cursor += 1
 
 
 class SeedlinkSignals(QObject):
@@ -575,7 +715,7 @@ class SeedlinkListener(threading.Thread):
     HEADER_LEN  = 8    # "SL" + 6-byte sequence number
     RECORD_LEN  = 512  # fixed MiniSEED record size
 
-    def __init__(self, host, port, network, station, location, buffers, staging, staging_lock, window_secs):
+    def __init__(self, host, port, network, station, location, buffers, aligner, window_secs):
         super().__init__(daemon=True)
         self.host         = host
         self.port         = port
@@ -583,8 +723,7 @@ class SeedlinkListener(threading.Thread):
         self.station      = station
         self.location     = location   # e.g. "00"
         self.buffers      = buffers
-        self.staging      = staging       # {ch: deque} drained by display timer
-        self.staging_lock = staging_lock  # protects staging across threads
+        self.aligner      = aligner       # ChannelAligner drained by display timer
         self.maxlen       = window_secs * SAMPLE_RATE * BUFFER_FACTOR
         self.running      = True
         self.signals      = SeedlinkSignals()
@@ -682,15 +821,16 @@ class SeedlinkListener(threading.Thread):
         sock.close()
 
     def _ingest(self, raw):
-        ch, samples = _decode_miniseed(raw)
+        if not self.running:   # stopped listener must not feed a reset aligner
+            return
+        ch, start, samples = _decode_miniseed(raw)
         if ch is None or not samples:
             return
         ch_key = ch[-3:] if len(ch) >= 3 else ch
         if ch_key not in self.buffers:
             return
-        # Write to staging deque under lock — display timer drains at fixed rate
-        with self.staging_lock:
-            self.staging[ch_key].extend(samples)
+        # Align by record start time — display timer drains at fixed rate
+        self.aligner.push(ch_key, start, samples)
         prev = self.packet_count
         self.last_packet[ch_key]  = time.time()
         self.packet_count        += 1
@@ -872,6 +1012,170 @@ class ConnectionBanner(QLabel):
 
 
 # ---------------------------------------------------------------------------
+# Particle motion (3D)
+# ---------------------------------------------------------------------------
+
+class ParticleMotionWindow(QWidget):
+    """
+    Rotatable 3D trace of ground motion: x = East, y = North, z = Up.
+
+    Reads the same time-aligned display buffers as the waveform panels.
+    Each channel is high-passed identically (trailing 1 s moving-average
+    removal) to strip the DC offset and drift without introducing any
+    phase difference between channels, then all three share one scale
+    so the shape of the motion is not distorted.
+
+    Requires PyOpenGL (pyqtgraph.opengl); the caller handles ImportError.
+    """
+
+    TRAIL_CHOICES  = [2, 5, 10]            # seconds of motion shown
+    TRAIL_DEFAULT  = 5
+    HIGHPASS_SECS  = 1                     # moving-average window
+    TRAIL_COLOR    = (1.0, 0.85, 0.40)     # amber
+    SCALE_DECAY    = 0.97                  # per-frame shrink of display scale
+
+    def __init__(self, buffers, parent=None):
+        import pyqtgraph.opengl as gl   # raises ImportError without PyOpenGL
+
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.Window)
+        self.setWindowTitle("Raspberry Shake -- Particle Motion")
+        self.resize(680, 620)
+        self.buffers    = buffers
+        self.trail_secs = self.TRAIL_DEFAULT
+        self._scale     = 0.0
+
+        # Map physical directions to stream channels (board labels are swapped)
+        physical = {label: ch for ch, label in CHANNEL_LABELS.items()}
+        self.ch_e = physical["EHE"]
+        self.ch_n = physical["EHN"]
+        self.ch_z = physical["EHZ"]
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
+
+        bar = QHBoxLayout()
+        self.info = QLabel("Waiting for data...")
+        self.info.setFont(QFont("Courier New", 9))
+        self.info.setStyleSheet("color:#888; background:transparent;")
+        bar.addWidget(self.info)
+        bar.addStretch()
+
+        trail_lbl = QLabel("Trail:")
+        trail_lbl.setStyleSheet("color:#888; background:transparent;")
+        bar.addWidget(trail_lbl)
+        self.trail_box = QComboBox()
+        for secs in self.TRAIL_CHOICES:
+            self.trail_box.addItem(f"{secs} s", secs)
+        self.trail_box.setCurrentIndex(self.TRAIL_CHOICES.index(self.TRAIL_DEFAULT))
+        self.trail_box.currentIndexChanged.connect(
+            lambda i: setattr(self, "trail_secs", self.trail_box.itemData(i))
+        )
+        bar.addWidget(self.trail_box)
+
+        reset_btn = QPushButton("Reset View")
+        reset_btn.setStyleSheet("""
+            QPushButton { background:#1C2128; color:#999; border:1px solid #2D333B;
+                          border-radius:3px; padding:2px 10px; }
+            QPushButton:hover { background:#2D333B; color:#DDD; }
+        """)
+        reset_btn.clicked.connect(self._reset_view)
+        bar.addWidget(reset_btn)
+        layout.addLayout(bar)
+
+        self.view = gl.GLViewWidget()
+        self.view.setBackgroundColor("#0D1117")
+        layout.addWidget(self.view, stretch=1)
+
+        grid = gl.GLGridItem()
+        grid.setSize(2, 2)
+        grid.setSpacing(0.25, 0.25)
+        grid.setColor((255, 255, 255, 28))
+        self.view.addItem(grid)
+
+        # Axes colored like the matching waveform panel, labeled at both ends
+        for vec, ch, pos_lbl, neg_lbl in [
+            ((1, 0, 0), self.ch_e, "E", "W"),
+            ((0, 1, 0), self.ch_n, "N", "S"),
+            ((0, 0, 1), self.ch_z, "Up", "Down"),
+        ]:
+            v = np.array(vec, dtype=float)
+            color = QColor(CHANNEL_COLORS[ch])
+            self.view.addItem(gl.GLLinePlotItem(
+                pos=np.array([-v, v]), color=color, width=1.5, antialias=True
+            ))
+            for p, text in [(v * 1.12, pos_lbl), (-v * 1.12, neg_lbl)]:
+                self.view.addItem(gl.GLTextItem(
+                    pos=p, text=text, color=color, font=QFont("Arial", 10)
+                ))
+
+        self.trail = gl.GLLinePlotItem(
+            pos=np.zeros((2, 3)), width=2, antialias=True, mode="line_strip"
+        )
+        self.view.addItem(self.trail)
+        self.head = gl.GLScatterPlotItem(
+            pos=np.zeros((1, 3)), size=9, color=(1, 1, 1, 1)
+        )
+        self.view.addItem(self.head)
+        self._reset_view()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)   # ~30 fps is plenty for a 3D trail
+        self._timer.timeout.connect(self._update)
+
+    def _reset_view(self):
+        self.view.setCameraPosition(distance=4.2, elevation=22, azimuth=-60)
+
+    def showEvent(self, event):
+        self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def _highpassed(self, ch, m, w):
+        """Last m-w+1 samples of channel ch minus a trailing w-sample mean."""
+        x = np.array(self.buffers[ch], dtype=np.float64)[-m:]
+        c = np.concatenate(([0.0], np.cumsum(x)))
+        mean = (c[w:] - c[:-w]) / w
+        return x[w - 1:] - mean
+
+    def _update(self):
+        n = self.trail_secs * SAMPLE_RATE
+        w = self.HIGHPASS_SECS * SAMPLE_RATE
+        avail = min(len(self.buffers[ch]) for ch in (self.ch_e, self.ch_n, self.ch_z))
+        if avail < w + 2:
+            self.trail.setData(pos=np.zeros((2, 3)))
+            self.head.setData(pos=np.zeros((1, 3)))
+            self.info.setText("Waiting for data...")
+            return
+        m = min(n + w - 1, avail)
+        pts = np.column_stack([
+            self._highpassed(self.ch_e, m, w),
+            self._highpassed(self.ch_n, m, w),
+            self._highpassed(self.ch_z, m, w),
+        ])
+
+        # Shared scale for all axes; grows instantly, shrinks slowly
+        peak = float(np.abs(pts).max())
+        self._scale = max(peak, self._scale * self.SCALE_DECAY, 1.0)
+        pts /= self._scale
+
+        # Fade the trail from transparent (oldest) to opaque (newest)
+        colors = np.empty((len(pts), 4))
+        colors[:, :3] = self.TRAIL_COLOR
+        colors[:, 3] = np.linspace(0.05, 1.0, len(pts))
+        self.trail.setData(pos=pts, color=colors)
+        self.head.setData(pos=pts[-1:])
+        self.info.setText(
+            f"Last {len(pts) / SAMPLE_RATE:.0f} s  |  high-pass ~0.5 Hz"
+            f"  |  full scale ±{self._scale:,.0f} counts"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -889,12 +1193,9 @@ class MainWindow(QMainWindow):
 
         maxlen = window_secs * SAMPLE_RATE * BUFFER_FACTOR
         self.buffers = {ch: deque(maxlen=maxlen) for ch in CHANNELS}
-        # Staging deques: SEEDLINK thread appends here; display timer drains
-        # exactly samples_per_tick samples per channel per tick for smooth scroll.
-        # maxlen = 2 seconds of samples so a burst never causes unbounded lag.
-        staging_maxlen = SAMPLE_RATE * 2
-        self.staging = {ch: deque(maxlen=staging_maxlen) for ch in CHANNELS}
-        self._staging_lock = threading.Lock()   # protect cross-thread access
+        # SEEDLINK thread pushes time-stamped records here; display timer pulls
+        # exactly samples_per_tick time-aligned samples per channel per tick.
+        self.aligner = ChannelAligner(CHANNELS)
         self.panels  = {}
         self._streaming    = False   # True while SEEDLINK is connected
         self._paused       = False   # True while gap-filling zeros into buffer
@@ -907,6 +1208,7 @@ class MainWindow(QMainWindow):
         self._rs_network = network
         self._rs_station = station
         self._gap_timer  = None    # QTimer that pumps zeros while paused
+        self._pm_window  = None    # ParticleMotionWindow, created on demand
 
         self._build_ui()
         self._start_seedlink(rs_host, port, network, station)
@@ -977,6 +1279,21 @@ class MainWindow(QMainWindow):
         """)
         clear_btn.clicked.connect(self._clear_screen)
         header.addWidget(clear_btn)
+
+        # Particle motion (3D) button
+        pm_btn = QPushButton("  Particle Motion  ")
+        pm_btn.setFixedHeight(28)
+        pm_btn.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        pm_btn.setStyleSheet("""
+            QPushButton {
+                background: #3B341A; color: #FFD966;
+                border: 1px solid #6B5E2D; border-radius: 4px; padding: 0 14px;
+            }
+            QPushButton:hover   { background: #5C5022; color: #FFE699; }
+            QPushButton:pressed { background: #7A6A2A; }
+        """)
+        pm_btn.clicked.connect(self._show_particle_motion)
+        header.addWidget(pm_btn)
 
         # Pause / Resume button
         self.stop_btn = QPushButton("  Pause  ")
@@ -1063,13 +1380,25 @@ class MainWindow(QMainWindow):
                 QPushButton:pressed { background: #7A5528; }
             """)
 
+    def _show_particle_motion(self):
+        if self._pm_window is None:
+            try:
+                self._pm_window = ParticleMotionWindow(self.buffers, parent=self)
+            except ImportError:
+                QMessageBox.warning(
+                    self, "Particle Motion",
+                    "The 3D view needs PyOpenGL.\n\nInstall it with:\n"
+                    "    pip install PyOpenGL"
+                )
+                return
+        self._pm_window.show()
+        self._pm_window.raise_()
+        self._pm_window.activateWindow()
+
     def _clear_screen(self):
-        """Wipe display buffers and staging deques — traces reset to blank."""
-        with self._staging_lock:
-            for buf in self.buffers.values():
-                buf.clear()
-            for stg in self.staging.values():
-                stg.clear()
+        """Wipe display buffers — traces reset to blank; stream continues."""
+        for buf in self.buffers.values():
+            buf.clear()
         for panel in self.panels.values():
             panel.curve.setData([])
 
@@ -1082,7 +1411,7 @@ class MainWindow(QMainWindow):
             self._paused    = True
 
             # 2. Gap-fill: _tick already runs continuously; while _paused=True
-            #    it injects zeros instead of draining the staging queue.
+            #    it injects zeros instead of pulling from the aligner.
             pass  # nothing extra needed — _tick handles it
 
             self.stop_btn.setText("  Resume  ")
@@ -1100,10 +1429,8 @@ class MainWindow(QMainWindow):
             self.banner.set_connected(False)
         else:
             # ── RESUME ────────────────────────────────────────────────────
-            # 1. Flush stale staging data so we don't replay backlog on resume
-            with self._staging_lock:
-                for stg in self.staging.values():
-                    stg.clear()
+            # 1. Flush stale aligned data so we don't replay backlog on resume
+            self.aligner.reset()
             self._paused = False
 
             # 2. Reconnect SEEDLINK — live data follows the gap seamlessly
@@ -1127,11 +1454,10 @@ class MainWindow(QMainWindow):
         Called every 40 ms (25 Hz). Advances every channel by exactly
         samples_per_tick = 4 samples, keeping all three channels in lockstep.
 
-        Live:   takes up to 4 samples from each staging deque.
-                If staging has fewer than 4 (between RS bursts), pads with
-                the last known value so scroll speed stays constant.
-                If staging has built up a backlog (e.g. after resume), it
-                drains at the normal 4/tick rate — lag clears within seconds.
+        Live:   pulls 4 time-aligned samples per channel from the aligner.
+                Between RS bursts all channels hold their last value together
+                so scroll speed stays constant; any surplus latency built up
+                that way is drained gradually (see ChannelAligner).
 
         Paused: injects 4 zeros per channel — identical scroll speed, flat line.
         """
@@ -1142,24 +1468,15 @@ class MainWindow(QMainWindow):
                 buf.extend([0] * samples_per_tick)
             return
 
-        with self._staging_lock:
-            for ch, buf in self.buffers.items():
-                stg = self.staging[ch]
-                batch = []
-                for _ in range(samples_per_tick):
-                    if stg:
-                        batch.append(stg.popleft())
-                    else:
-                        # Pad with last known value to keep scroll steady
-                        batch.append(buf[-1] if buf else 0)
-                buf.extend(batch)
+        batch = self.aligner.pull(samples_per_tick)
+        for ch, buf in self.buffers.items():
+            buf.extend(batch[ch])
 
     def _start_seedlink(self, host, port, network, station):
         self.listener = SeedlinkListener(
             host=host, port=port, network=network, station=station,
             location=RS_LOCATION_CODE,
-            buffers=self.buffers, staging=self.staging,
-            staging_lock=self._staging_lock,
+            buffers=self.buffers, aligner=self.aligner,
             window_secs=self.window_secs,
         )
         self.listener.signals.status_changed.connect(self.status_bar.showMessage)
@@ -1168,7 +1485,7 @@ class MainWindow(QMainWindow):
         self._streaming = True
 
     def _start_timer(self):
-        # Data tick: drain staging queues at 25 Hz (4 samples/tick = 100 sps)
+        # Data tick: pull aligned samples at 25 Hz (4 samples/tick = 100 sps)
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(40)
         self._tick_timer.timeout.connect(self._tick)
@@ -1245,6 +1562,8 @@ class MainWindow(QMainWindow):
         self._tick_timer.stop()
         self._draw_timer.stop()
         self.listener.stop()
+        if self._pm_window is not None:
+            self._pm_window.close()
         event.accept()
 
 

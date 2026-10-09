@@ -62,7 +62,7 @@ REM ── 2. Install / upgrade dependencies ───────────�
 echo.
 echo Installing dependencies (this may take a minute)...
 "%PYTHON%" -m pip install --upgrade --quiet pip
-"%PYTHON%" -m pip install --quiet PyQt6 pyqtgraph numpy paramiko pyinstaller
+"%PYTHON%" -m pip install --quiet PyQt6 pyqtgraph numpy paramiko PyOpenGL pyinstaller
 
 if errorlevel 1 (
     echo [ERROR] pip install failed. Check your internet connection.
@@ -102,6 +102,7 @@ if not exist "%ICON%" (
     --noconfirm ^
     --onefile ^
     --windowed ^
+    --hidden-import pyqtgraph.opengl ^
     --name "RaspberryShakeViewer" ^
     %ICON_FLAG% ^
     --distpath "%DIST_DIR%" ^

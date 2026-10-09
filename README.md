@@ -14,7 +14,9 @@ Built for outreach activities at the [Center for Earthquake Research and Informa
 - **SEEDLINK over TCP** — reliable, ordered stream; no RS-side UDP configuration needed
 - **Auto-discovery** — finds the RS at `192.168.1.2`, `192.168.1.3`, or `rs.local` in parallel
 - **SSH clock sync** — checks and fixes RS clock drift before streaming starts
-- **Smooth scrolling** — staging deque architecture decouples bursty SEEDLINK delivery from the 60 fps display
+- **Time-aligned channels** — samples are matched across EHZ/EHE/EHN by their MiniSEED timestamps, not by arrival order
+- **Smooth scrolling** — a fixed-rate display clock decouples bursty SEEDLINK delivery from the 60 fps display
+- **3D particle motion** — rotatable East/North/Up trace of the ground motion over the last 2–10 s
 - **Shared amplitude scaling** — all three channels use the same Y range for direct comparison
 - **Lock Scale** — freeze the Y range before touching the RS so handling spikes don't blow up the scale
 - **Pause / Resume** — SEEDLINK disconnects on pause; a flat gap scrolls through the plot; live signal resumes seamlessly after the gap
@@ -29,8 +31,10 @@ Built for outreach activities at the [Center for Earthquake Research and Informa
 - Raspberry Shake connected to the same local network (router)
 
 ```bash
-pip install PyQt6 pyqtgraph numpy paramiko
+pip install PyQt6 pyqtgraph numpy paramiko PyOpenGL
 ```
+
+`PyOpenGL` is only needed for the 3D particle-motion window; the rest of the app runs without it.
 
 ---
 
@@ -79,6 +83,7 @@ Double-click `build_and_install.bat`. It will:
 | **Lock Scale** | Freeze Y range at the current value (turns amber) |
 | **Auto Scale** | Return to adaptive scaling |
 | **Clear** | Wipe traces; stream continues |
+| **Particle Motion** | Open the 3D particle-motion window (drag to rotate, scroll to zoom) |
 | **Pause** | Disconnect SEEDLINK; flat gap scrolls through plot |
 | **Resume** | Reconnect; live signal follows the gap |
 
@@ -96,6 +101,19 @@ Double-click `build_and_install.bat`. It will:
 | `--ssh-user` | `myshake` | RS SSH username |
 | `--ssh-pass` | `earthday2023` | RS SSH password |
 | `--skip-preflight` | off | Skip discovery + clock sync |
+
+---
+
+## Particle Motion
+
+The **Particle Motion** window plots the ground's path through space: East on X, North on Y, Up on Z. The trail fades from oldest to newest, and the white dot marks the current position.
+
+- All three channels are high-passed identically (≈0.5 Hz, trailing 1 s mean removal) to remove the sensor's DC offset and drift without shifting their relative phase.
+- All axes share one scale, so the shape of the motion isn't distorted. The full-scale value in counts is shown in the window's top bar.
+- Axes follow the physical directions (the board's E/N labels are swapped; see `CHANNEL_LABELS`).
+- Choose a 2, 5 or 10 s trail. Shorter trails make linear P-wave motion and elliptical Rayleigh-wave motion easier to see.
+
+The display runs a few seconds behind real time (≈ one MiniSEED record plus network delay). That's the cost of waiting until every channel has data for the same instant.
 
 ---
 
