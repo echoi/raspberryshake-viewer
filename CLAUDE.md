@@ -85,13 +85,19 @@ python raspberryshake_viewer.py --demo
 
 ## Status (as of 2026-10-15)
 
-Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite, 3D depth cues (shadows, drop line, auto-rotate, wider field of view), low-latency UDP transport (2026-10-15, commit 5ac1b9d; full suite passed 44/44, 3 runs in a row), UDP as the default with automatic SEEDLINK fallback and switch-back (2026-10-15), fix for the display falling further behind as the plots filled (2026-10-15: wall-clock sample consumption, 1 px pen, no grid, peak decimation).
+Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite, 3D depth cues (shadows, drop line, auto-rotate, wider field of view), low-latency UDP transport (2026-10-15, commit 5ac1b9d; full suite passed 44/44, 3 runs in a row), UDP as the default with automatic SEEDLINK fallback and switch-back (2026-10-15), fix for the display falling further behind as the plots filled (2026-10-15, commit e4fa130: wall-clock sample consumption, 1 px pen, no grid, peak decimation; 54/54 tests, 3 runs in a row).
 
 Depth-cue ideas suggested but not built, if 3D still feels flat: brightness or color by distance from the camera, a shaded tube instead of a line, three flat side views next to the 3D window.
 
-Never verified on real hardware or Windows. Check these first when you have the Shake:
-- Live streaming on a real Shake over SEEDLINK: real record lengths decide the display delay (5–7 s expected on a quiet site). Watch for dropped records, which would mean the `xn` check is failing.
-- UDP (the default) on a real Shake: the packet format (`{'EHZ', <epoch>, samples...}`) and the Shake's UDP setup steps in the README come from Raspberry Shake's documented datacast format, not from testing against hardware. Confirm the format, the delay (~0.4 s expected), and the Windows firewall prompt.
+Hardware feedback so far:
+- **2026-10-15, UDP on the real Shake works.** The owner ran the viewer on a computer connected to the Shake: the title showed `UDP :8888` and taps were captured promptly. So the Shake's datacast was set up and the packet format parses. The same session revealed the growing-delay bug, fixed in e4fa130.
+- **Not yet confirmed on hardware:** that e4fa130 keeps the display real-time once the traces fill past mid-window (measured ~0.37 s steady with the demo stream here). If it still lags, ask how long until it starts and whether the Particle Motion window was open.
+- **Visible change in e4fa130:** the faint y-grid is gone from the waveform panels (it cost ~45 fps). If the owner wants it back, use a few cheap `InfiniteLine`s repositioned in `set_y_range`, not `showGrid`.
+
+Still unverified. Check these when you have the Shake:
+- Live streaming on a real Shake over SEEDLINK (now only the fallback): real record lengths decide the display delay (5–7 s expected on a quiet site). Watch for dropped records, which would mean the `xn` check is failing.
+- The automatic SEEDLINK fallback and switch-back against the real Shake (tested only against demo servers).
+- Which OS the 2026-10-15 hardware test ran on wasn't recorded. If it wasn't Windows, the Windows firewall prompt for inbound UDP 8888 is still unchecked.
 - The Windows `.exe` build: `--hidden-import pyqtgraph.opengl` and PyOpenGL were added to `build_and_install.bat` but haven't been tested. `--demo` on the outreach laptop tests everything after the network connection.
 
 Known open items, not started:
