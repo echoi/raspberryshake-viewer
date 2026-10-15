@@ -17,8 +17,8 @@ Shake SEEDLINK :18000 (or DemoSeedlinkServer on 127.0.0.1:<ephemeral>)
 Shake UDP datacast -> :8888 (or DemoUdpSender -> 127.0.0.1:<free port>)
   -> UdpListener (thread): "{'EHZ', <epoch>, n1, n2, ...}" ~25 samples/packet
   -> _parse_rs_udp -> ChannelAligner.push (same as above)
-  -> MainWindow._tick, 25 Hz: aligner.pull(4) -> self.buffers (deques)
-  -> MainWindow._refresh, 60 fps: WaveformPanel plots
+  -> MainWindow._tick, ~25 Hz: aligner.pull(samples due by wall clock) -> self.buffers
+  -> MainWindow._refresh, 60 fps: WaveformPanel plots (peak-decimated to ~2 pts/pixel)
   -> ParticleMotionWindow._update, 30 fps: reads the same buffers
 ```
 
@@ -55,13 +55,19 @@ Shake UDP datacast -> :8888 (or DemoUdpSender -> 127.0.0.1:<free port>)
   - The fallback is shown in a blue `ConnectionBanner.set_notice()` row, not in the title, which is truncated at the default width. The amber banner is still the "source is down" warning.
   - `MainWindow(port=...)` is the SEEDLINK port; `udp_port` is separate. Tests must pass `transport=` explicitly (the default is `auto`, which waits for UDP first).
   - Demo: `DemoShake` serves SEEDLINK and/or UDP with one shared `DemoQuakes`, like a real Shake.
+- **Display performance (found on real hardware, 2026-10-15).** The display lagged more and more as the plots filled up (25 s behind after 75 s), and Clear only seemed to help. Keep these, or the bug comes back:
+  - `_tick` pulls `elapsed × SAMPLE_RATE` samples (carrying the fraction), not a fixed 4 per tick. When painting is slow, Qt timers fire less often, and a per-tick count made the display consume fewer than 100 samples/s, so the aligner backlog grew without bound. The original code hid this because its 2 s staging deque dropped the excess. Regression test: `test_display_keeps_real_time_when_drawing_is_slow` (blocks the event loop 60 ms of every 70 ms).
+  - The waveform pen must stay **1 px**. Qt's raster engine strokes wider lines on a slow path: 1.2 px gave 9 fps vs 65 fps with full buffers. `grab()`-based benchmarks don't show this, so measure frame rate in a live window.
+  - **No y-grid** on the waveform panels. pyqtgraph draws the grid through the AxisItem, and replaying it cost ~18 ms per panel per frame (~15 fps vs ~62 fps live). Opacity doesn't matter; an opaque grid is just as slow.
+  - `WaveformPanel._peak_decimate` keeps each bin's min/max (~1 bin per pixel column), with bins aligned to the absolute sample count (`MainWindow._samples_total`) so the trace doesn't shimmer while scrolling. pyqtgraph's own auto-downsampling doesn't kick in below ~5 samples per pixel, so it did nothing here.
+  - Clear never drained the delay (the backlog is in the aligner, which Clear doesn't touch). It only looked better because emptying the plots made frames cheap again.
 - **Python 3.9+** is the target (README). Avoid newer syntax such as `match`.
 
 ## Development
 
 ```bash
 pip install -r requirements-dev.txt   # app deps + pytest + obspy (test-only reference)
-pytest                                # 49 tests, ~40 s, headless (conftest sets QT_QPA_PLATFORM=offscreen)
+pytest                                # 54 tests, ~52 s, headless (conftest sets QT_QPA_PLATFORM=offscreen)
 python raspberryshake_viewer.py --demo
 ```
 
@@ -79,7 +85,7 @@ python raspberryshake_viewer.py --demo
 
 ## Status (as of 2026-10-15)
 
-Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite, 3D depth cues (shadows, drop line, auto-rotate, wider field of view), low-latency UDP transport (2026-10-15, commit 5ac1b9d; full suite passed 44/44, 3 runs in a row), UDP as the default with automatic SEEDLINK fallback and switch-back (2026-10-15).
+Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite, 3D depth cues (shadows, drop line, auto-rotate, wider field of view), low-latency UDP transport (2026-10-15, commit 5ac1b9d; full suite passed 44/44, 3 runs in a row), UDP as the default with automatic SEEDLINK fallback and switch-back (2026-10-15), fix for the display falling further behind as the plots filled (2026-10-15: wall-clock sample consumption, 1 px pen, no grid, peak decimation).
 
 Depth-cue ideas suggested but not built, if 3D still feels flat: brightness or color by distance from the camera, a shaded tube instead of a line, three flat side views next to the 3D window.
 

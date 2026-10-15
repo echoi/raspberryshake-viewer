@@ -191,10 +191,11 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite runs headless (Qt offscreen) and takes about 40 seconds. It uses [obspy](https://github.com/obspy/obspy) as an independent reference for MiniSEED (obspy is a test-only dependency; the app doesn't need it). It covers:
+The suite runs headless (Qt offscreen) and takes about 50 seconds. It uses [obspy](https://github.com/obspy/obspy) as an independent reference for MiniSEED (obspy is a test-only dependency; the app doesn't need it). It covers:
 
 - **Decoder** (`tests/test_decoder.py`): Steim-1/2 samples and start times match obspy for every packing width; corrupt and unsupported records are rejected
 - **Channel alignment** (`tests/test_aligner.py`): channels stay sample-aligned when each arrives with different record sizes and delays, plus overlaps, short gaps and long gaps
+- **Display** (`tests/test_display.py`, plus a slow-drawing test in `tests/test_udp.py`): peak decimation keeps every spike and the newest sample at a bounded point count, with bins that don't shift while scrolling; the display stays real-time even when drawing is slow
 - **Transport selection** (`tests/test_transport.py`): auto mode falls back to SEEDLINK when there's no UDP data, prefers UDP when present, and recovers both ways (UDP → SEEDLINK → UDP) with low delay restored; `--udp` never falls back; `--seedlink` mode
 - **UDP transport** (`tests/test_udp.py`): packet parsing (including malformed packets and Shake 4D accelerometer channels); with the demo UDP sender, display delay stays under 1 s and channels stay sample-aligned end to end
 - **Demo mode** (`tests/test_demo.py`): obspy decodes the demo's records exactly; synthetic P/S waves are linear in the right directions and Rayleigh waves are retrograde ellipses; an end-to-end run (demo server → SEEDLINK → decode → align → display buffers) keeps the P wave linear along its ray

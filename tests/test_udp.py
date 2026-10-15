@@ -86,3 +86,23 @@ def test_udp_end_to_end_alignment():
         assert sv[1] / sv[0] < 0.15
     finally:
         win.close()
+
+
+def test_display_keeps_real_time_when_drawing_is_slow():
+    """Regression: on a slow machine, painting starved the 25 Hz data tick and
+    the display consumed fewer than 100 samples/s, so the delay grew without
+    bound (25 s after 75 s on real hardware). Simulate heavy painting by
+    blocking the event loop most of the time; the delay must stay low."""
+    from PyQt6.QtCore import QTimer
+    app, demo, win = _run_udp_window()
+    hog = QTimer()
+    hog.timeout.connect(lambda: time.sleep(0.06))   # 60 ms busy of every 70 ms
+    try:
+        assert wait_until(lambda: win.aligner._cursor is not None, 10)
+        hog.start(70)
+        wait_until(lambda: False, 10)
+        delay = time.time() - win.aligner._cursor / rv.SAMPLE_RATE
+        assert delay < 1.5, f"display fell {delay:.1f} s behind under slow drawing"
+    finally:
+        hog.stop()
+        win.close()
