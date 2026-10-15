@@ -35,8 +35,8 @@ def _run_udp_window():
     demo = rv.DemoUdpSender(port, seed=11)
     demo.quakes._next_auto = float("inf")
     demo.start()
-    win = rv.MainWindow("127.0.0.1", port, "AM", "R8049", 60, demo=demo,
-                        transport="udp")
+    win = rv.MainWindow("127.0.0.1", None, "AM", "R8049", 60, demo=demo,
+                        transport="udp", udp_port=port)
     return app, demo, win
 
 

@@ -100,7 +100,8 @@ def test_end_to_end_demo_pipeline():
     demo = rv.DemoSeedlinkServer(seed=11)
     demo.quakes._next_auto = float("inf")
     demo.start()
-    win = rv.MainWindow("127.0.0.1", demo.port, "AM", "R8049", 60, demo=demo)
+    win = rv.MainWindow("127.0.0.1", demo.port, "AM", "R8049", 60, demo=demo,
+                        transport="seedlink")
     try:
         def wait_until(cond, timeout):
             loop, deadline = QEventLoop(), time.time() + timeout
