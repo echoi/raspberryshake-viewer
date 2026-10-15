@@ -55,12 +55,14 @@ Shake UDP datacast -> :8888 (or DemoUdpSender -> 127.0.0.1:<free port>)
 
 ```bash
 pip install -r requirements-dev.txt   # app deps + pytest + obspy (test-only reference)
-pytest                                # ~10 s, headless (conftest sets QT_QPA_PLATFORM=offscreen)
+pytest                                # 44 tests, ~21 s, headless (conftest sets QT_QPA_PLATFORM=offscreen)
 python raspberryshake_viewer.py --demo
 ```
 
 - The tests cover the decoder (vs obspy), the aligner, the demo encoder and physics, the UDP transport (parser, <1 s delay, alignment), and end-to-end runs (demo → buffers) for both transports.
 - `tests/helpers.py` imports obspy lazily, so `test_udp.py` and most of `test_aligner.py` run without obspy.
+- Most of the ~21 s is the two UDP tests and the two end-to-end tests, which each run a live window for several seconds. The UDP delay test depends on timing; it passed 3/3 runs, but if it flakes on a slow machine, look there first.
+- This machine (EC-DELL, WSL2) has sometimes had no network access mid-session. pip and git push fail then. The system `python3` (conda `my_env`) has the app deps but not pytest or obspy, so install dev requirements into a scratch venv rather than `my_env`.
 - The 3D GL window isn't covered, because it can't render offscreen. Check it visually or with `grabFramebuffer()`.
 - To show the tests are meaningful, a mutation that shifts one channel by 0.1 s in `ChannelAligner.push` fails three tests. Re-run that check when changing alignment logic.
 
@@ -71,7 +73,7 @@ python raspberryshake_viewer.py --demo
 
 ## Status (as of 2026-10-15)
 
-Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite, 3D depth cues (shadows, drop line, auto-rotate, wider field of view), low-latency `--udp` transport (2026-10-15).
+Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite, 3D depth cues (shadows, drop line, auto-rotate, wider field of view), low-latency `--udp` transport (2026-10-15, commit 5ac1b9d). Full suite passed 44/44 on that commit, 3 runs in a row.
 
 Depth-cue ideas suggested but not built, if 3D still feels flat: brightness or color by distance from the camera, a shaded tube instead of a line, three flat side views next to the 3D window.
 
