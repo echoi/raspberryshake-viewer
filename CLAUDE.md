@@ -13,6 +13,10 @@ Shake SEEDLINK :18000 (or DemoSeedlinkServer on 127.0.0.1:<ephemeral>)
   -> SeedlinkListener (thread): raw TCP, "SL"+6-hex header + 512-byte MiniSEED
   -> _decode_miniseed: header + Steim-1/2 -> (channel, start_time, samples)
   -> ChannelAligner.push (keyed by absolute sample index = epoch*100)
+   or, with --udp:
+Shake UDP datacast -> :8888 (or DemoUdpSender -> 127.0.0.1:<free port>)
+  -> UdpListener (thread): "{'EHZ', <epoch>, n1, n2, ...}" ~25 samples/packet
+  -> _parse_rs_udp -> ChannelAligner.push (same as above)
   -> MainWindow._tick, 25 Hz: aligner.pull(4) -> self.buffers (deques)
   -> MainWindow._refresh, 60 fps: WaveformPanel plots
   -> ParticleMotionWindow._update, 30 fps: reads the same buffers
@@ -43,6 +47,8 @@ Shake SEEDLINK :18000 (or DemoSeedlinkServer on 127.0.0.1:<ephemeral>)
 - **Demo:**
   - `DemoQuakes` schedules quakes relative to the time the demo started (the first after about 8 s, then about every 40 s). `trigger()` adds one 1 s out.
   - The server flushes partial records after `MAX_RECORD_SECS` (1 s) and adds a delivery delay per channel (`CHANNEL_LAG`) to exercise the aligner.
+- **Display delay is the transport, not the viewer.** Over SEEDLINK the Shake only sends full 512-byte records, which hold 5–7 s of quiet data, so the display runs 5–7 s behind; the aligner adds ~0.2 s (`LATENCY_MARGIN`). `--udp` gets ~0.4 s. Measured 2026-10-15 against fake servers: SEEDLINK quiet-site tap → screen 6.3 s, UDP 0.39 s. Don't try to "fix" SEEDLINK latency in the aligner: the samples don't exist on the laptop until the record arrives. The original code only looked faster because its 2 s staging deque discarded most of each record.
+- **Listeners share one interface** (`signals`, `last_packet`, `packet_count`, `_connected`, `port`, `transport_name`, `stop()`). `MainWindow._start_listener()` picks one by `transport`. UDP "connected" means a packet arrived within `NO_DATA_SECS`.
 - **Python 3.9+** is the target (README). Avoid newer syntax such as `match`.
 
 ## Development
@@ -53,7 +59,8 @@ pytest                                # ~10 s, headless (conftest sets QT_QPA_PL
 python raspberryshake_viewer.py --demo
 ```
 
-- The tests cover the decoder (vs obspy), the aligner, the demo encoder and physics, and an end-to-end run (demo → buffers).
+- The tests cover the decoder (vs obspy), the aligner, the demo encoder and physics, the UDP transport (parser, <1 s delay, alignment), and end-to-end runs (demo → buffers) for both transports.
+- `tests/helpers.py` imports obspy lazily, so `test_udp.py` and most of `test_aligner.py` run without obspy.
 - The 3D GL window isn't covered, because it can't render offscreen. Check it visually or with `grabFramebuffer()`.
 - To show the tests are meaningful, a mutation that shifts one channel by 0.1 s in `ChannelAligner.push` fails three tests. Re-run that check when changing alignment logic.
 
@@ -62,14 +69,15 @@ python raspberryshake_viewer.py --demo
 - The owner commits directly to `main` (no PR flow). Commit or push only when asked.
 - Commit messages: a summary line, a wrapped body explaining *why*, and the `Co-Authored-By` trailer.
 
-## Status (as of 2026-10-09)
+## Status (as of 2026-10-15)
 
-Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite, 3D depth cues (shadows, drop line, auto-rotate, wider field of view). All pushed.
+Done: minor fixes, 3D particle motion, timestamp alignment, Steim decoder fixes, `--demo` mode with a Quake! button, pytest suite, 3D depth cues (shadows, drop line, auto-rotate, wider field of view), low-latency `--udp` transport (2026-10-15).
 
 Depth-cue ideas suggested but not built, if 3D still feels flat: brightness or color by distance from the camera, a shaded tube instead of a line, three flat side views next to the 3D window.
 
 Never verified on real hardware or Windows. Check these first when you have the Shake:
-- Live streaming on a real Shake: real record lengths decide the display delay (about 4 s against the fake server). Watch for dropped records, which would mean the `xn` check is failing.
+- Live streaming on a real Shake over SEEDLINK: real record lengths decide the display delay (5–7 s expected on a quiet site). Watch for dropped records, which would mean the `xn` check is failing.
+- `--udp` on a real Shake: the packet format (`{'EHZ', <epoch>, samples...}`) and the Shake's UDP setup steps in the README come from Raspberry Shake's documented datacast format, not from testing against hardware. Confirm the format, the delay (~0.4 s expected), and the Windows firewall prompt.
 - The Windows `.exe` build: `--hidden-import pyqtgraph.opengl` and PyOpenGL were added to `build_and_install.bat` but haven't been tested. `--demo` on the outreach laptop tests everything after the network connection.
 
 Known open items, not started:

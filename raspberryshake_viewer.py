@@ -9,10 +9,11 @@ Features:
   * SSH clock-sync pre-flight: checks and fixes RS date before starting
   * 3-channel scrolling waveform with per-channel and global amplitude controls
   * SEEDLINK TCP stream -- reliable, ordered, no RS-side UDP config needed
+  * --udp: the Shake's UDP data stream instead, for sub-second display delay
   * Auto-reconnect with on-screen amber warning banner when connection drops
   * Channels time-aligned from MiniSEED record timestamps
   * Rotatable 3D particle-motion view (needs PyOpenGL)
-  * --demo mode: built-in synthetic Shake served over local SEEDLINK
+  * --demo mode: built-in synthetic Shake served over local SEEDLINK (or UDP)
 
 Requirements:
     pip install PyQt6 pyqtgraph numpy paramiko PyOpenGL
@@ -29,6 +30,8 @@ Optional CLI args:
     --ssh-user      RS SSH username       (default: myshake)
     --ssh-pass      RS SSH password       (default: earthday2023)
     --skip-preflight  Skip discovery and clock-sync dialog
+    --udp           Use the Shake's UDP stream (low latency)
+    --udp-port      UDP port to listen on (default: 8888)
     --demo          Simulate a Raspberry Shake (synthetic quakes, no hardware)
 """
 
@@ -58,6 +61,7 @@ import pyqtgraph as pg
 
 RS_CANDIDATE_HOSTS  = ["192.168.1.2", "192.168.1.3", "rs.local"]  # IPs first — avoids slow mDNS on Windows
 RS_SEEDLINK_PORT    = 18000
+RS_UDP_PORT_DEFAULT = 8888      # where the Shake's UDP output is sent (--udp)
 RS_SSH_PORT         = 22
 RS_SSH_USER_DEFAULT = "myshake"
 RS_SSH_PASS_DEFAULT = "earthday2023"
@@ -720,6 +724,7 @@ class SeedlinkListener(threading.Thread):
     Auto-reconnects with amber banner on disconnect.
     """
 
+    transport_name = "SEEDLINK"
     HEADER_LEN  = 8    # "SL" + 6-byte sequence number
     RECORD_LEN  = 512  # fixed MiniSEED record size
 
@@ -845,6 +850,125 @@ class SeedlinkListener(threading.Thread):
         if prev == 0:
             self.signals.status_changed.emit(
                 f"SEEDLINK LIVE -- first record: {ch}  ({len(samples)} samples)"
+            )
+
+    def _set_connected(self, state):
+        if state != self._connected:
+            self._connected = state
+            self.signals.connection_changed.emit(state)
+
+    def stop(self):
+        self.running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# UDP listener  (Raspberry Shake "datacast" -- low latency)
+# ---------------------------------------------------------------------------
+#
+# SEEDLINK only sends a 512-byte record once it is full, which on a quiet site
+# holds 5-7 s of data, so the display can't run closer than that to real time.
+# The Shake can also push each channel over UDP in small packets (~0.25 s):
+#
+#   b"{'EHZ', 1557760183.330, 16450, 16466, 16412, ...}"
+#    channel, start time (epoch s), then integer counts
+#
+# This needs a one-time setting on the Shake (send UDP to this laptop's IP and
+# port). Packets go into the same ChannelAligner, so alignment, display and
+# particle motion are unchanged.
+# ---------------------------------------------------------------------------
+
+def _parse_rs_udp(data):
+    """
+    Parse one Raspberry Shake UDP packet.
+    Returns (channel: str, start_time: float, samples: list[int]),
+    or (None, None, []) if the packet is malformed.
+    """
+    try:
+        parts = data.decode("ascii").strip().strip("{}").split(",")
+        channel = parts[0].strip().strip("'\"")
+        start   = float(parts[1])
+        samples = [int(p) for p in parts[2:]]
+        return channel, start, samples
+    except (UnicodeDecodeError, ValueError, IndexError):
+        return None, None, []
+
+
+class UdpListener(threading.Thread):
+    """
+    Receives Raspberry Shake UDP packets and feeds the ChannelAligner.
+    Same interface as SeedlinkListener, so MainWindow treats them alike.
+    UDP has no connection, so "connected" means a packet arrived recently.
+    """
+
+    transport_name = "UDP"
+    NO_DATA_SECS   = 5   # no packets for this long -> show the warning banner
+
+    def __init__(self, port, aligner):
+        super().__init__(daemon=True)
+        self.host         = "0.0.0.0"
+        self.port         = port
+        self.aligner      = aligner
+        self.running      = True
+        self.signals      = SeedlinkSignals()
+        self.last_packet  = {ch: None for ch in CHANNELS}
+        self.packet_count = 0
+        self._connected   = False
+        self._last_any    = None
+        self._sock        = None
+
+    def run(self):
+        while self.running:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.host, self.port))
+                sock.settimeout(1.0)
+                self._sock = sock
+            except OSError as e:
+                if self.running:
+                    self.signals.status_changed.emit(
+                        f"UDP -- cannot listen on port {self.port}: {e} "
+                        f"-- retrying in {RECONNECT_DELAY}s..."
+                    )
+                    time.sleep(RECONNECT_DELAY)
+                continue
+            self.signals.status_changed.emit(
+                f"UDP -- listening on port {self.port}, waiting for the Shake..."
+            )
+            self._receive(sock)
+
+    def _receive(self, sock):
+        while self.running:
+            try:
+                data, _ = sock.recvfrom(4096)
+            except socket.timeout:
+                if (self._connected and
+                        time.time() - self._last_any > self.NO_DATA_SECS):
+                    self._set_connected(False)
+                continue
+            except OSError:
+                return   # socket closed by stop()
+            self._ingest(data)
+
+    def _ingest(self, data):
+        if not self.running:   # stopped listener must not feed a reset aligner
+            return
+        ch, start, samples = _parse_rs_udp(data)
+        if ch not in self.last_packet or not samples:
+            return   # e.g. accelerometer (EN?) channels from a Shake 4D
+        self.aligner.push(ch, start, samples)
+        prev = self.packet_count
+        self._last_any = self.last_packet[ch] = time.time()
+        self.packet_count += 1
+        self._set_connected(True)
+        if prev == 0:
+            self.signals.status_changed.emit(
+                f"UDP LIVE -- first packet: {ch}  ({len(samples)} samples)"
             )
 
     def _set_connected(self, state):
@@ -1029,7 +1153,32 @@ class DemoQuakes:
         return e, n, z
 
 
-class DemoSeedlinkServer(threading.Thread):
+class _DemoShake(threading.Thread):
+    """Synthetic Shake signal shared by the SEEDLINK and UDP demo sources."""
+
+    DC_OFFSET    = {"EHZ": 16500, "EHN": -8200, "EHE": 3100}
+    NOISE_COUNTS = 120
+
+    def __init__(self, seed=None):
+        super().__init__(daemon=True)
+        self.quakes = DemoQuakes(seed)
+        self._rng = np.random.default_rng()
+        # Physical direction -> stream channel (the board labels are swapped)
+        physical = {label: ch for ch, label in CHANNEL_LABELS.items()}
+        self._ch_e, self._ch_n, self._ch_z = physical["EHE"], physical["EHN"], physical["EHZ"]
+
+    def _samples(self, first_idx, end_idx):
+        """Integer counts per channel for sample indices [first_idx, end_idx)."""
+        t = np.arange(first_idx, end_idx) / SAMPLE_RATE
+        e, n, z = self.quakes.motion(t)
+        out = {}
+        for ch, x in ((self._ch_e, e), (self._ch_n, n), (self._ch_z, z)):
+            x = x + self.DC_OFFSET[ch] + self._rng.normal(0, self.NOISE_COUNTS, len(t))
+            out[ch] = np.round(x).astype(int).tolist()
+        return out
+
+
+class DemoSeedlinkServer(_DemoShake):
     """
     Minimal SEEDLINK server on 127.0.0.1 streaming synthetic EHZ/EHN/EHE.
 
@@ -1040,22 +1189,16 @@ class DemoSeedlinkServer(threading.Thread):
 
     MAX_RECORD_SECS = 1.0
     CHANNEL_LAG     = {"EHZ": 0.0, "EHN": 0.35, "EHE": 0.7}
-    DC_OFFSET       = {"EHZ": 16500, "EHN": -8200, "EHE": 3100}
-    NOISE_COUNTS    = 120
 
     def __init__(self, network=RS_NETWORK_DEFAULT, station=RS_STATION_DEFAULT,
                  location=RS_LOCATION_CODE, seed=None):
-        super().__init__(daemon=True)
+        super().__init__(seed)
         self.network, self.station, self.location = network, station, location
-        self.quakes = DemoQuakes(seed)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))   # any free port
         self._sock.listen()
         self.port = self._sock.getsockname()[1]
-        # Physical direction -> stream channel (the board labels are swapped)
-        physical = {label: ch for ch, label in CHANNEL_LABELS.items()}
-        self._ch_e, self._ch_n, self._ch_z = physical["EHE"], physical["EHN"], physical["EHZ"]
 
     def run(self):
         while True:
@@ -1085,7 +1228,6 @@ class DemoSeedlinkServer(threading.Thread):
             conn.close()
 
     def _stream(self, conn):
-        rng = np.random.default_rng()
         next_idx = int(time.time() * SAMPLE_RATE)
         pending  = {ch: [] for ch in CHANNELS}
         start    = {ch: next_idx for ch in CHANNELS}
@@ -1096,11 +1238,8 @@ class DemoSeedlinkServer(threading.Thread):
             now = time.time()
             now_idx = int(now * SAMPLE_RATE)
             if now_idx > next_idx:
-                t = np.arange(next_idx, now_idx) / SAMPLE_RATE
-                e, n, z = self.quakes.motion(t)
-                for ch, x in ((self._ch_e, e), (self._ch_n, n), (self._ch_z, z)):
-                    x = x + self.DC_OFFSET[ch] + rng.normal(0, self.NOISE_COUNTS, len(t))
-                    pending[ch].extend(np.round(x).astype(int).tolist())
+                for ch, x in self._samples(next_idx, now_idx).items():
+                    pending[ch].extend(x)
                 next_idx = now_idx
 
             for ch in CHANNELS:
@@ -1127,6 +1266,53 @@ class DemoSeedlinkServer(threading.Thread):
 
     def stop(self):
         self._sock.close()
+
+
+class DemoUdpSender(_DemoShake):
+    """
+    Sends synthetic data as Raspberry Shake UDP packets to 127.0.0.1:port,
+    like a real Shake's datacast: PACKET_SAMPLES per channel per packet, each
+    channel with a small, different delivery delay.
+    """
+
+    PACKET_SAMPLES = 25                       # 0.25 s at 100 sps
+    CHANNEL_LAG    = {"EHZ": 0.0, "EHN": 0.05, "EHE": 0.1}
+
+    def __init__(self, port, seed=None):
+        super().__init__(seed)
+        self.port = port
+        self._running = True
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        next_idx = int(time.time() * SAMPLE_RATE)
+        outbox = []   # (send_time, packet)
+        while self._running:
+            now = time.time()
+            while int(now * SAMPLE_RATE) >= next_idx + self.PACKET_SAMPLES:
+                end = next_idx + self.PACKET_SAMPLES
+                for ch, x in self._samples(next_idx, end).items():
+                    packet = "{'%s', %.3f, %s}" % (
+                        ch, next_idx / SAMPLE_RATE, ", ".join(map(str, x)))
+                    outbox.append((now + self.CHANNEL_LAG[ch], packet.encode()))
+                next_idx = end
+            outbox.sort(key=lambda item: item[0])
+            while outbox and outbox[0][0] <= now:
+                sock.sendto(outbox.pop(0)[1], ("127.0.0.1", self.port))
+            time.sleep(0.01)
+        sock.close()
+
+    def stop(self):
+        self._running = False
+
+
+def _free_udp_port():
+    """A UDP port on localhost that is currently free."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 # ---------------------------------------------------------------------------
@@ -1267,8 +1453,9 @@ class WaveformPanel(QFrame):
 # ---------------------------------------------------------------------------
 
 class ConnectionBanner(QLabel):
-    def __init__(self):
+    def __init__(self, message="SEEDLINK connection lost -- attempting to reconnect..."):
         super().__init__()
+        self.message = message
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFont(QFont("Arial", 9))
         self.setFixedHeight(24)
@@ -1278,9 +1465,7 @@ class ConnectionBanner(QLabel):
         if connected:
             self.hide()
         else:
-            self.setText(
-                "  SEEDLINK connection lost -- attempting to reconnect..."
-            )
+            self.setText("  " + self.message)
             self.setStyleSheet(
                 "background:#7C5500; color:#FFD966; border-radius:4px; padding:0 8px;"
             )
@@ -1563,11 +1748,13 @@ class ParticleMotionWindow(QWidget):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    def __init__(self, rs_host, port, network, station, window_secs, demo=None):
+    def __init__(self, rs_host, port, network, station, window_secs, demo=None,
+                 transport="seedlink"):
         super().__init__()
         self.rs_host     = rs_host or "unknown"
         self.window_secs = window_secs
-        self.demo        = demo      # DemoSeedlinkServer in --demo mode, else None
+        self.demo        = demo      # demo data source in --demo mode, else None
+        self.transport   = transport # "seedlink" or "udp"
         self.setWindowTitle(
             "Raspberry Shake -- Live Waveform Viewer" + ("  [DEMO]" if demo else "")
         )
@@ -1579,11 +1766,11 @@ class MainWindow(QMainWindow):
 
         maxlen = window_secs * SAMPLE_RATE * BUFFER_FACTOR
         self.buffers = {ch: deque(maxlen=maxlen) for ch in CHANNELS}
-        # SEEDLINK thread pushes time-stamped records here; display timer pulls
+        # Listener thread pushes time-stamped samples here; display timer pulls
         # exactly samples_per_tick time-aligned samples per channel per tick.
         self.aligner = ChannelAligner(CHANNELS)
         self.panels  = {}
-        self._streaming    = False   # True while SEEDLINK is connected
+        self._streaming    = False   # True while the listener is running
         self._paused       = False   # True while gap-filling zeros into buffer
         self._auto_scale   = True    # True = auto Y range; False = fixed range
         self._locked_peak  = DEFAULT_Y_RANGE  # peak captured when Lock Scale clicked
@@ -1597,7 +1784,7 @@ class MainWindow(QMainWindow):
         self._pm_window  = None    # ParticleMotionWindow, created on demand
 
         self._build_ui()
-        self._start_seedlink(rs_host, port, network, station)
+        self._start_listener()
         self._start_timer()
 
     def _build_ui(self):
@@ -1613,7 +1800,7 @@ class MainWindow(QMainWindow):
             ("<span style='color:#FFB347;'>DEMO</span>&nbsp;&nbsp;" if self.demo else "")
             + f"Raspberry Shake  --  Real-Time Seismograph"
             + ("" if self.demo else
-               f"   <span style='font-size:10px; color:#444;'>({self.rs_host})</span>")
+               f"   <span style='font-size:10px; color:#444;'>({self._source_label()})</span>")
         )
         title.setFont(QFont("Georgia", 13, QFont.Weight.Bold))
         title.setStyleSheet("color:#E6EDF3; background:transparent;")
@@ -1717,7 +1904,11 @@ class MainWindow(QMainWindow):
 
         root.addLayout(header)
 
-        self.banner = ConnectionBanner()
+        self.banner = ConnectionBanner(
+            "No UDP data from the Shake -- check its UDP output (datacast) settings..."
+            if self.transport == "udp" else
+            "SEEDLINK connection lost -- attempting to reconnect..."
+        )
         root.addWidget(self.banner)
 
         sep = QFrame()
@@ -1810,7 +2001,7 @@ class MainWindow(QMainWindow):
     def _toggle_stream(self):
         if not self._paused:
             # ── PAUSE ─────────────────────────────────────────────────────
-            # 1. Stop SEEDLINK — no more real samples arrive
+            # 1. Stop the listener — no more real samples arrive
             self.listener.stop()
             self._streaming = False
             self._paused    = True
@@ -1838,12 +2029,9 @@ class MainWindow(QMainWindow):
             self.aligner.reset()
             self._paused = False
 
-            # 2. Reconnect SEEDLINK — live data follows the gap seamlessly
+            # 2. Restart the listener — live data follows the gap seamlessly
             # Do NOT re-arm _initial_range — keep the scale that was active at pause
-            self._start_seedlink(
-                self._rs_host, self._rs_port,
-                self._rs_network, self._rs_station
-            )
+            self._start_listener()
             self.stop_btn.setText("  Pause  ")
             self.stop_btn.setStyleSheet("""
                 QPushButton {
@@ -1877,13 +2065,22 @@ class MainWindow(QMainWindow):
         for ch, buf in self.buffers.items():
             buf.extend(batch[ch])
 
-    def _start_seedlink(self, host, port, network, station):
-        self.listener = SeedlinkListener(
-            host=host, port=port, network=network, station=station,
-            location=RS_LOCATION_CODE,
-            buffers=self.buffers, aligner=self.aligner,
-            window_secs=self.window_secs,
-        )
+    def _source_label(self):
+        if self.transport == "udp":
+            return f"UDP :{self._rs_port}"
+        return self.rs_host
+
+    def _start_listener(self):
+        if self.transport == "udp":
+            self.listener = UdpListener(port=self._rs_port, aligner=self.aligner)
+        else:
+            self.listener = SeedlinkListener(
+                host=self._rs_host, port=self._rs_port,
+                network=self._rs_network, station=self._rs_station,
+                location=RS_LOCATION_CODE,
+                buffers=self.buffers, aligner=self.aligner,
+                window_secs=self.window_secs,
+            )
         self.listener.signals.status_changed.connect(self.status_bar.showMessage)
         self.listener.signals.connection_changed.connect(self.banner.set_connected)
         self.listener.start()
@@ -1948,6 +2145,8 @@ class MainWindow(QMainWindow):
             panel.set_y_range(shared_peak)
 
         pkts = self.listener.packet_count
+        name = self.listener.transport_name
+        unit = "Packets" if self.transport == "udp" else "Records"
         if self.listener._connected:
             if active:
                 demo_info = ""
@@ -1955,17 +2154,19 @@ class MainWindow(QMainWindow):
                     wait = self.demo.quakes.next_arrival() - time.time()
                     demo_info = f"   |  DEMO: next quake in ~{max(0, wait):.0f} s"
                 self.status_bar.showMessage(
-                    f"SEEDLINK LIVE  --  Channels: {', '.join(active)}"
-                    f"   |  Records received: {pkts}{demo_info}"
+                    f"{name} LIVE  --  Channels: {', '.join(active)}"
+                    f"   |  {unit} received: {pkts}{demo_info}"
                 )
             else:
                 self.status_bar.showMessage(
-                    f"SEEDLINK connected -- waiting for first record...   |  Records: {pkts}"
+                    f"{name} connected -- waiting for first data...   |  {unit}: {pkts}"
                 )
         else:
-            self.status_bar.showMessage(
-                f"SEEDLINK -- connecting to {self.rs_host}:{self.listener.port}..."
-            )
+            if self.transport == "udp":
+                msg = f"UDP -- listening on port {self.listener.port}, waiting for the Shake..."
+            else:
+                msg = f"SEEDLINK -- connecting to {self.rs_host}:{self.listener.port}..."
+            self.status_bar.showMessage(msg)
 
     def closeEvent(self, event):
         self._tick_timer.stop()
@@ -1983,7 +2184,7 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Raspberry Shake SEEDLINK waveform viewer")
+    parser = argparse.ArgumentParser(description="Raspberry Shake live waveform viewer")
     parser.add_argument("--rs-host",        default=None)
     parser.add_argument("--port",           default=RS_SEEDLINK_PORT, type=int)
     parser.add_argument("--window",         default=60, type=int)
@@ -1992,9 +2193,13 @@ def main():
     parser.add_argument("--ssh-user",       default=RS_SSH_USER_DEFAULT)
     parser.add_argument("--ssh-pass",       default=RS_SSH_PASS_DEFAULT)
     parser.add_argument("--skip-preflight", action="store_true")
+    parser.add_argument("--udp", action="store_true",
+                        help="receive the Shake's UDP data stream instead of "
+                             "SEEDLINK (low latency; needs UDP output set up on the Shake)")
+    parser.add_argument("--udp-port", default=RS_UDP_PORT_DEFAULT, type=int)
     parser.add_argument("--demo", action="store_true",
                         help="simulate a Raspberry Shake with synthetic quakes "
-                             "(no hardware needed)")
+                             "(no hardware needed); combine with --udp to simulate UDP")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
@@ -2011,9 +2216,15 @@ def main():
     app.setPalette(palette)
 
     demo = None
-    port = args.port
+    transport = "udp" if args.udp else "seedlink"
+    port = args.udp_port if args.udp else args.port
     rs_host = args.rs_host
-    if args.demo:
+    if args.demo and args.udp:
+        port = _free_udp_port()
+        demo = DemoUdpSender(port)
+        demo.start()
+        rs_host = "127.0.0.1"
+    elif args.demo:
         demo = DemoSeedlinkServer(network=args.network, station=args.station)
         demo.start()
         rs_host, port = "127.0.0.1", demo.port
@@ -2033,6 +2244,7 @@ def main():
         station=args.station,
         window_secs=args.window,
         demo=demo,
+        transport=transport,
     )
     win.show()
     sys.exit(app.exec())

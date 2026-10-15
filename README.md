@@ -12,6 +12,7 @@ Built for outreach activities at the [Center for Earthquake Research and Informa
 
 - **Three-channel live display** — EHZ (vertical), EHE (east), EHN (north)
 - **SEEDLINK over TCP** — reliable, ordered stream; no RS-side UDP configuration needed
+- **Low-latency UDP mode** — `--udp` uses the Shake's UDP data stream, so the display runs well under a second behind the ground instead of 5–7 s
 - **Auto-discovery** — finds the RS at `192.168.1.2`, `192.168.1.3`, or `rs.local` in parallel
 - **SSH clock sync** — checks and fixes RS clock drift before streaming starts
 - **Time-aligned channels** — samples are matched across EHZ/EHE/EHN by their MiniSEED timestamps, not by arrival order
@@ -120,7 +121,9 @@ Double-click `build_and_install.bat`. It will:
 | `--ssh-user` | `myshake` | RS SSH username |
 | `--ssh-pass` | `earthday2023` | RS SSH password |
 | `--skip-preflight` | off | Skip discovery + clock sync |
-| `--demo` | off | Simulate a Raspberry Shake with synthetic quakes (no hardware) |
+| `--udp` | off | Receive the Shake's UDP data stream instead of SEEDLINK (low latency) |
+| `--udp-port` | `8888` | UDP port to listen on with `--udp` |
+| `--demo` | off | Simulate a Raspberry Shake with synthetic quakes (no hardware); add `--udp` to simulate UDP |
 
 ---
 
@@ -149,6 +152,23 @@ Connect the laptop and RS to the same router. The RS will get `192.168.1.2` or `
 
 The RS runs a SEEDLINK server on port 18000 by default — no forwarding rules needed.
 
+### Display delay: SEEDLINK vs UDP
+
+Over SEEDLINK the display runs **5–7 seconds behind** the ground when it's quiet. That's not the viewer: the Shake only sends a 512-byte record once it's full, and quiet data compresses so well that one record holds 5–7 s. (Measured: a tap reached the screen 6.3 s later. The viewer itself adds only ~0.2 s.) Strong shaking fills records faster, but the record that was already filling still has to finish first.
+
+For live demos, use the Shake's **UDP data stream**, which sends ~0.25 s packets. Measured tap-to-screen delay: **~0.4 s**.
+
+```bash
+python raspberryshake_viewer.py --udp
+```
+
+One-time setup:
+1. **On the Shake:** open its web configuration page (`http://rs.local`, or its IP address) and find the UDP output setting (Raspberry Shake calls it *datacast*). Add a destination: the laptop's IP address and port `8888`. Menu names vary between Shake OS versions.
+2. **Give the laptop a fixed IP.** The Shake sends to one fixed address, so reserve the laptop's IP in the router (DHCP reservation). Otherwise the stream stops when the laptop gets a new address.
+3. **Allow it through the firewall.** On Windows, allow inbound UDP on port 8888 for the viewer (Windows Defender Firewall usually asks the first time it runs).
+
+Everything else (alignment, Pause/Resume, particle motion) works the same over UDP. If the stream stops, an amber banner appears after 5 s and goes away when packets return. To try UDP without hardware, run `python raspberryshake_viewer.py --demo --udp`.
+
 ---
 
 ## Troubleshooting
@@ -159,6 +179,8 @@ The RS runs a SEEDLINK server on port 18000 by default — no forwarding rules n
 | SSH clock sync fails | Verify `--ssh-pass`; RS must be reachable on port 22 |
 | "Connected — waiting for first record…" | Normal for a few seconds; SEEDLINK buffers before sending |
 | Amber banner stays on | RS may have rebooted; app reconnects automatically |
+| Display is 5–7 s behind the ground | Expected with SEEDLINK (see [Display delay](#display-delay-seedlink-vs-udp)); use `--udp` |
+| `--udp`: "waiting for the Shake..." / "No UDP data" banner | Check the Shake's UDP output points at this laptop's *current* IP and port 8888, and that the firewall allows inbound UDP 8888 |
 | Waveforms flat after launch | Wait ~5 s for initial auto-range to kick in |
 
 ---
@@ -174,6 +196,7 @@ The suite runs headless (Qt offscreen) and takes about 10 seconds. It uses [obsp
 
 - **Decoder** (`tests/test_decoder.py`): Steim-1/2 samples and start times match obspy for every packing width; corrupt and unsupported records are rejected
 - **Channel alignment** (`tests/test_aligner.py`): channels stay sample-aligned when each arrives with different record sizes and delays, plus overlaps, short gaps and long gaps
+- **UDP transport** (`tests/test_udp.py`): packet parsing (including malformed packets and Shake 4D accelerometer channels); with the demo UDP sender, display delay stays under 1 s and channels stay sample-aligned end to end
 - **Demo mode** (`tests/test_demo.py`): obspy decodes the demo's records exactly; synthetic P/S waves are linear in the right directions and Rayleigh waves are retrograde ellipses; an end-to-end run (demo server → SEEDLINK → decode → align → display buffers) keeps the P wave linear along its ray
 
 ---
